@@ -1,0 +1,35 @@
+# 環境變數（含 API 金鑰，絕對不能上傳）
+.env
+
+# Python 虛擬環境
+.venv/
+venv/
+env/
+
+# Python 快取
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# 歷史數據（體積大，不進版控）
+data/*.csv
+data/*.json
+
+# 日誌（本地產生，不進版控）
+logs/*.log
+
+# IDE 設定
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 系統檔案
+.DS_Store
+Thumbs.db
+
+# 保留資料夾結構
+!data/.gitkeep
+!logs/.gitkeep

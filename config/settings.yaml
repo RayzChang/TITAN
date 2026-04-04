@@ -1,0 +1,59 @@
+# ============================================================
+# TITAN v1 — 交易參數設定檔
+# 修改此檔案來調整所有交易行為
+# ============================================================
+
+# ===== 交易模式 =====
+# testnet: 使用幣安測試網（假錢，安全練習）
+# live:    使用正式網（真實資金，請謹慎！）
+mode: "testnet"
+
+# ===== 交易標的 =====
+symbols:
+  mode: "auto_top20"       # 自動追蹤市值前 20 大幣種
+  exclude:                  # 排除以下幣種（穩定幣、不適合做合約的）
+    - "USDT"
+    - "USDC"
+    - "BUSD"
+    - "DAI"
+    - "TUSD"
+    - "FDUSD"
+
+# ===== 策略設定 =====
+strategy:
+  name: "ema_crossover"    # 使用的策略名稱
+  timeframe: "15m"          # K 線週期（1m, 5m, 15m, 1h, 4h）
+
+  # EMA 交叉 + RSI 過濾策略參數
+  ema_crossover:
+    fast_period: 9           # 快線 EMA 週期
+    slow_period: 21          # 慢線 EMA 週期
+    rsi_period: 14           # RSI 週期
+    rsi_overbought: 70       # RSI 超買閾值（高於此值不做多）
+    rsi_oversold: 30         # RSI 超賣閾值（低於此值不做空）
+
+# ===== 風險管理 =====
+risk:
+  leverage: 20               # 槓桿倍數（BOSS 已確認）
+  margin_type: "cross"       # 保證金模式：cross（全倉）或 isolated（逐倉）
+  position_size_pct: 10      # 每筆交易佔總資金的百分比（10% = $500/筆）
+  max_open_positions: 3      # 最多同時開幾個倉位
+  stop_loss_pct: 1.5         # 止損百分比（價格反向 1.5% 平倉）
+  take_profit_pct: 3.0       # 止盈百分比（價格正向 3.0% 平倉）
+  max_daily_loss_pct: 5.0    # 單日最大虧損限制（超過則停止當日交易）
+  max_daily_trades: 20       # 每日最大交易次數
+  consecutive_loss_pause: 3  # 連續虧損幾次後暫停交易（暫停 1 小時）
+  drawdown_stop_pct: 20      # 帳戶從高點回撤多少 % 後停止所有交易
+  anomaly_skip_pct: 5.0      # 單根 K 線波動超過此 % 則跳過不進場
+
+# ===== 資金設定 =====
+capital:
+  total_usdt: 5000           # 總投入資金（USDT）
+  reserve_pct: 0             # 保留比例（0 = 不保留，全部可用）
+  compound: true             # 複利模式：true = 獲利自動滾入本金
+
+# ===== 執行設定 =====
+execution:
+  check_interval_seconds: 30   # 每幾秒檢查一次市場訊號
+  use_market_orders: true       # true = 市價單（即時成交），false = 限價單
+  slippage_tolerance_pct: 0.1  # 可接受的最大滑點百分比
