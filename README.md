@@ -2,7 +2,7 @@
   <img src="https://img.shields.io/badge/TITAN-v1.1-blue?style=for-the-badge&logo=bitcoin&logoColor=white" alt="TITAN v1.1"/>
   <img src="https://img.shields.io/badge/Python-3.14-green?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.14"/>
   <img src="https://img.shields.io/badge/Binance-Futures-yellow?style=for-the-badge&logo=binance&logoColor=white" alt="Binance Futures"/>
-  <img src="https://img.shields.io/badge/Phase-2%20Complete-brightgreen?style=for-the-badge" alt="Phase 2 Complete"/>
+  <img src="https://img.shields.io/badge/Phase-3%20Live-brightgreen?style=for-the-badge" alt="Phase 3 Live"/>
   <img src="https://img.shields.io/badge/License-MIT-red?style=for-the-badge" alt="MIT License"/>
 </p>
 
@@ -23,7 +23,7 @@
 |------|------|
 | Phase 1 基礎建設 | ✅ 完成 |
 | Phase 2 策略 + 回測 | ✅ 完成 |
-| Phase 3 Demo 實盤模擬 | 🔄 進行中 |
+| Phase 3 Demo 實盤模擬 | ✅ 完成（交易迴圈已上線） |
 | Phase 4 正式上線 | ⏳ 待定 |
 
 **當前策略版本：V1.1**（EMA 交叉 + RSI + 趨勢濾網 + 成交量濾網）
@@ -46,9 +46,11 @@
 | **市值動態掃描** | 透過 CoinGecko 追蹤真實市值前 20 大幣種，交叉比對幣安合約可用性 |
 | **多重過濾策略** | EMA 交叉 + RSI + 長期趨勢濾網（EMA-100）+ 成交量確認 |
 | **嚴格風控** | 止損止盈、日損限制、連續虧損暫停、帳戶回撤保護 |
-| **複利機制** | 獲利自動滾入本金，動態調整倉位大小 |
+| **複利機制** | `compound: true` 時每次以最新帳戶餘額計算倉位，獲利自動滾入本金 |
+| **倉位監控** | PositionManager 即時追蹤持倉，自動偵測 SL/TP 觸發並記錄損益 |
+| **每日報告** | UTC 00:01 自動輸出損益/勝率/逐筆明細（繁體中文格式） |
+| **優雅關閉** | Ctrl+C 自動強制平倉 → 輸出最終報告 → 安全退出 |
 | **Demo 模式** | 支援幣安 Demo Trading，用真實行情完整驗證策略 |
-| **繁體中文日誌** | 所有日誌與報告均為繁體中文，清晰易讀 |
 | **事件驅動回測** | 嚴格防止 lookahead bias，訊號在 K 線 i，成交在 K 線 i+1 開盤價 |
 
 ---
@@ -264,8 +266,8 @@ Day 180 ─  $29,460  (+489.2%)
 | V1.0 | Day 1-3 | 基礎建設 + 策略初版 | ✅ |
 | V1.1 | Day 4-6 | 回測分析、策略第一輪優化（趨勢+成交量濾網） | ✅ |
 | V1.2 | Day 7-9 | ATR 動態止損實驗、回測再驗證 | ✅ |
-| V1.3 | Day 10-12 | Demo 實盤上線、即時數據驗證 | 🔄 |
-| V1.4 | Day 13-15 | Demo 數據分析、策略微調 | ⏳ |
+| V1.3 | Day 10-12 | Demo 完整交易迴圈上線（倉位管理、複利、每日報告） | ✅ |
+| V1.4 | Day 13-15 | Demo 數據分析、策略微調 | 🔄 |
 | V1.5+ | Day 16+ | 穩定性強化、正式上線準備 | ⏳ |
 
 ---
