@@ -42,39 +42,71 @@ class Exchange:
         if not api_key or not api_secret:
             raise ValueError(f"[連線失敗] 找不到 {mode_label} API 金鑰，請檢查 .env 檔案")
 
-        self.exchange = ccxt.binance({
+        params = {
             "apiKey": api_key,
             "secret": api_secret,
             "options": {
                 "defaultType": "future",  # USDT-M 合約
+                "recvWindow": 60000,
+                "adjustForTimeDifference": True,
             },
-        })
+        }
 
+        # Demo Trading 模式：使用 demo-fapi.binance.com
         if self.is_testnet:
-            self.exchange.set_sandbox_mode(True)
+            params["urls"] = {
+                "api": {
+                    "fapiPublic":    "https://demo-fapi.binance.com/fapi/v1",
+                    "fapiPrivate":   "https://demo-fapi.binance.com/fapi/v1",
+                    "fapiPublicV2":  "https://demo-fapi.binance.com/fapi/v2",
+                    "fapiPrivateV2": "https://demo-fapi.binance.com/fapi/v2",
+                    "fapiPublicV3":  "https://demo-fapi.binance.com/fapi/v3",
+                    "fapiPrivateV3": "https://demo-fapi.binance.com/fapi/v3",
+                }
+            }
 
-        # 驗證連線
+        self.exchange = ccxt.binance(params)
+
+        # Demo Trading：覆寫所有 fapi 端點到 demo-fapi.binance.com
+        if self.is_testnet:
+            demo_base = "https://demo-fapi.binance.com"
+            for key in list(self.exchange.urls["api"].keys()):
+                if key.startswith("fapi"):
+                    version = "v2" if "V2" in key else ("v3" if "V3" in key else "v1")
+                    self.exchange.urls["api"][key] = f"{demo_base}/fapi/{version}"
+
+        # 載入市場資料（公開端點）
         try:
             self.exchange.load_markets()
+        except Exception as e:
+            logger.warning(f"[load_markets] {e}，嘗試繼續...")
+
+        # 驗證 API 金鑰（私有端點）
+        try:
+            self.exchange.fapiPrivateV2GetAccount()
             logger.info(f"✅ 成功連線至幣安{mode_label}")
-        except ccxt.AuthenticationError:
-            raise ConnectionError(f"[連線失敗] API 金鑰驗證失敗，請確認 {mode_label} 金鑰是否正確")
+        except ccxt.AuthenticationError as e:
+            raise ConnectionError(f"[連線失敗] API 金鑰驗證失敗，請確認 {mode_label} 金鑰是否正確：{e}")
 
     def get_balance(self) -> float:
         """取得帳戶 USDT 可用餘額"""
         def _fetch():
-            balance = self.exchange.fetch_balance()
-            usdt = balance.get("USDT", {})
-            return float(usdt.get("free", 0))
+            account = self.exchange.fapiPrivateV2GetAccount()
+            for asset in account.get("assets", []):
+                if asset["asset"] == "USDT":
+                    return float(asset["availableBalance"])
+            return 0.0
 
         return self._retry(_fetch, "取得餘額")
 
     def get_total_balance(self) -> float:
         """取得帳戶 USDT 總餘額（含未實現損益）"""
         def _fetch():
-            balance = self.exchange.fetch_balance()
-            usdt = balance.get("USDT", {})
-            return float(usdt.get("total", 0))
+            account = self.exchange.fapiPrivateV2GetAccount()
+            for asset in account.get("assets", []):
+                if asset["asset"] == "USDT":
+                    return float(asset["walletBalance"])
+            return 0.0
 
         return self._retry(_fetch, "取得總餘額")
 
@@ -97,22 +129,32 @@ class Exchange:
         return self._retry(_fetch, f"取得K線 {symbol} {timeframe}")
 
     def set_leverage(self, symbol: str, leverage: int):
-        """設定槓桿倍數"""
+        """設定槓桿倍數（直接呼叫 fapi，不走 sapi）"""
+        ccxt_symbol = symbol.replace("/", "").replace(":USDT", "")  # BTC/USDT:USDT → BTCUSDT
         def _set():
-            self.exchange.set_leverage(leverage, symbol)
+            self.exchange.fapiPrivatePostLeverage({
+                "symbol": ccxt_symbol,
+                "leverage": leverage,
+            })
             logger.info(f"槓桿設定：{symbol} = {leverage}x")
 
         self._retry(_set, f"設定槓桿 {symbol}")
 
     def set_margin_type(self, symbol: str, margin_type: str):
-        """設定保證金模式：cross（全倉）或 isolated（逐倉）"""
+        """設定保證金模式（直接呼叫 fapi，不走 sapi）"""
+        ccxt_symbol = symbol.replace("/", "").replace(":USDT", "")
         margin_upper = margin_type.upper()
         try:
-            self.exchange.set_margin_mode(margin_upper, symbol)
+            self.exchange.fapiPrivatePostMarginType({
+                "symbol": ccxt_symbol,
+                "marginType": margin_upper,   # CROSSED 或 ISOLATED
+                "margintype": margin_upper,   # 部分版本用小寫 key
+            })
             logger.info(f"保證金模式：{symbol} = {'全倉' if margin_upper == 'CROSS' else '逐倉'}")
         except ccxt.ExchangeError as e:
-            # 已是相同模式時幣安會報錯，可忽略
-            if "No need to change margin type" in str(e):
+            err = str(e)
+            # 已是相同模式、或 Demo Trading 不需要更改→忽略
+            if "No need to change margin type" in err or "-4046" in err or "-1102" in err:
                 pass
             else:
                 raise

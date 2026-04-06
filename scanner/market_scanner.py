@@ -37,22 +37,29 @@ class MarketScanner:
         return symbols
 
     def _fetch_top_symbols(self) -> list[str]:
-        """從幣安取得所有 USDT-M 合約，按 24h 交易量排序，取前 20"""
+        """從幣安取得所有 USDT-M 合約，按 24h 交易量排序，取前 20
+        直接呼叫 fapiPublic（不走 sapi），相容 Demo Trading"""
         try:
-            tickers = self.ex.exchange.fetch_tickers()
+            # 直接用 ccxt 底層方法呼叫 GET /fapi/v1/ticker/24hr
+            raw_tickers = self.ex.exchange.fapiPublicGetTicker24hr()
         except Exception as e:
             logger.error(f"[掃描失敗] 無法取得行情列表：{e}")
             return self._fallback_symbols()
 
         exclude = self.symbols_cfg.get("exclude", [])
-        all_valid = filter_symbols(list(tickers.keys()), exclude)
+        exclude_set = {s.upper() for s in exclude} | {"USDT", "USDC", "BUSD", "DAI", "TUSD", "FDUSD"}
 
-        # 按 24h 報價量排序（quoteVolume = USDT 交易量）
         scored = []
-        for sym in all_valid:
-            ticker = tickers.get(sym, {})
-            vol = float(ticker.get("quoteVolume") or 0)
-            scored.append((sym, vol))
+        for t in raw_tickers:
+            raw_sym = t.get("symbol", "")        # e.g. BTCUSDT
+            if not raw_sym.endswith("USDT"):
+                continue
+            base = raw_sym[:-4]                  # BTC
+            if base in exclude_set:
+                continue
+            ccxt_sym = f"{base}/USDT:USDT"
+            vol = float(t.get("quoteVolume") or 0)
+            scored.append((ccxt_sym, vol))
 
         scored.sort(key=lambda x: x[1], reverse=True)
         top = [sym for sym, _ in scored[: self.top_n]]
