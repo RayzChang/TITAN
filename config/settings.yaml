@@ -11,6 +11,8 @@ mode: "testnet"
 # ===== 交易標的 =====
 symbols:
   mode: "auto_top20"       # 自動追蹤市值前 20 大幣種
+  min_quote_volume_usdt: 50000000   # 最低 24h 交易量（5千萬 USDT），過濾低流動性幣
+  min_price_usdt: 0.001             # 最低幣價（$0.001），過濾微型幣（止損精度問題）
   exclude:                  # 排除以下幣種（穩定幣、不適合做合約的）
     - "USDT"
     - "USDC"
@@ -29,8 +31,22 @@ strategy:
     fast_period: 9           # 快線 EMA 週期
     slow_period: 21          # 慢線 EMA 週期
     rsi_period: 14           # RSI 週期
-    rsi_overbought: 70       # RSI 超買閾值（高於此值不做多）
-    rsi_oversold: 30         # RSI 超賣閾值（低於此值不做空）
+    rsi_overbought: 65       # RSI 超買閾值（縮緊：70→65，減少追高）
+    rsi_oversold: 35         # RSI 超賣閾值（縮緊：30→35，減少追低）
+    # ── 趨勢濾網（V1.1 新增）──
+    trend_ema_period: 100    # 長期趨勢 EMA 週期（100 根）
+    use_trend_filter: true   # 啟用趨勢濾網：只順大趨勢方向交易
+    # ── 成交量確認（V1.1 新增）──
+    use_volume_filter: true  # 啟用成交量濾網：量能不足不進場
+    volume_ma_period: 20     # 成交量均線週期
+    volume_ratio_min: 1.2    # 成交量需高於均量的倍數（1.2 = 高於均量 20%）
+    # ── ATR 動態止損（V1.2 實驗，目前關閉）──
+    use_atr_sl: false
+    atr_period: 14
+    atr_sl_multiplier: 1.5
+    atr_tp_multiplier: 3.0
+    # ── MACD 動能確認（V1.2 實驗，目前關閉）──
+    use_macd_confirm: false
 
 # ===== 風險管理 =====
 risk:
@@ -38,8 +54,8 @@ risk:
   margin_type: "cross"       # 保證金模式：cross（全倉）或 isolated（逐倉）
   position_size_pct: 10      # 每筆交易佔總資金的百分比（10% = $500/筆）
   max_open_positions: 3      # 最多同時開幾個倉位
-  stop_loss_pct: 1.5         # 止損百分比（價格反向 1.5% 平倉）
-  take_profit_pct: 3.0       # 止盈百分比（價格正向 3.0% 平倉）
+  stop_loss_pct: 1.5         # 止損 1.5%
+  take_profit_pct: 3.0       # 止盈 3.0%（2:1 報酬風險比）
   max_daily_loss_pct: 5.0    # 單日最大虧損限制（超過則停止當日交易）
   max_daily_trades: 20       # 每日最大交易次數
   consecutive_loss_pause: 3  # 連續虧損幾次後暫停交易（暫停 1 小時）
