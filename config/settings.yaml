@@ -1,75 +1,54 @@
 # ============================================================
 # TITAN v1 — 交易參數設定檔
-# 修改此檔案來調整所有交易行為
+# 版本：V1.2（Version B 止損 / 風控暫停）
 # ============================================================
 
 # ===== 交易模式 =====
-# testnet: 使用幣安測試網（假錢，安全練習）
-# live:    使用正式網（真實資金，請謹慎！）
 mode: "testnet"
 
 # ===== 交易標的 =====
 symbols:
-  mode: "auto_top20"       # 自動追蹤市值前 20 大幣種
-  min_quote_volume_usdt: 50000000   # 最低 24h 交易量（5千萬 USDT），過濾低流動性幣
-  min_price_usdt: 0.001             # 最低幣價（$0.001），過濾微型幣（止損精度問題）
-  exclude:                  # 排除以下幣種（穩定幣、不適合做合約的）
-    - "USDT"
-    - "USDC"
-    - "BUSD"
-    - "DAI"
-    - "TUSD"
-    - "FDUSD"
+  mode: "manual"
+  list:
+    - "BTC/USDT"
+    - "ETH/USDT"
 
 # ===== 策略設定 =====
 strategy:
-  name: "ema_crossover"    # 使用的策略名稱
-  timeframe: "15m"          # K 線週期（1m, 5m, 15m, 1h, 4h）
+  name: "range_breakout"
+  timeframe: "1h"
 
-  # EMA 交叉 + RSI 過濾策略參數
-  ema_crossover:
-    fast_period: 9           # 快線 EMA 週期
-    slow_period: 21          # 慢線 EMA 週期
-    rsi_period: 14           # RSI 週期
-    rsi_overbought: 65       # RSI 超買閾值（縮緊：70→65，減少追高）
-    rsi_oversold: 35         # RSI 超賣閾值（縮緊：30→35，減少追低）
-    # ── 趨勢濾網（V1.1 新增）──
-    trend_ema_period: 100    # 長期趨勢 EMA 週期（100 根）
-    use_trend_filter: true   # 啟用趨勢濾網：只順大趨勢方向交易
-    # ── 成交量確認（V1.1 新增）──
-    use_volume_filter: true  # 啟用成交量濾網：量能不足不進場
-    volume_ma_period: 20     # 成交量均線週期
-    volume_ratio_min: 1.2    # 成交量需高於均量的倍數（1.2 = 高於均量 20%）
-    # ── ATR 動態止損（V1.2 實驗，目前關閉）──
-    use_atr_sl: false
-    atr_period: 14
-    atr_sl_multiplier: 1.5
-    atr_tp_multiplier: 3.0
-    # ── MACD 動能確認（V1.2 實驗，目前關閉）──
-    use_macd_confirm: false
+  range_breakout:
+    box_lookback: 120          # 日線回望根數（約 4 個月）
+    sl_pct: 3.0                # fallback 止損（箱體未偵測時用）
+    addon_candles: 3           # 加倉確認：連續幾根 4H K 棒
+    breakdown_vol_min: 1.5     # 箱體失效需要的最低量比
 
 # ===== 風險管理 =====
+# 注意：風控暫時全部拔掉（2026-04-12 決定），改跑 3 天 testnet 觀察
 risk:
-  leverage: 20               # 槓桿倍數（BOSS 已確認）
-  margin_type: "cross"       # 保證金模式：cross（全倉）或 isolated（逐倉）
-  position_size_pct: 10      # 每筆交易佔總資金的百分比（10% = $500/筆）
-  max_open_positions: 3      # 最多同時開幾個倉位
-  stop_loss_pct: 1.5         # 止損 1.5%
-  take_profit_pct: 3.0       # 止盈 3.0%（2:1 報酬風險比）
-  max_daily_loss_pct: 5.0    # 單日最大虧損限制（超過則停止當日交易）
-  max_daily_trades: 20       # 每日最大交易次數
-  consecutive_loss_pause: 3  # 連續虧損幾次後暫停交易（暫停 1 小時）
-  drawdown_stop_pct: 20      # 帳戶從高點回撤多少 % 後停止所有交易
-  anomaly_skip_pct: 5.0      # 單根 K 線波動超過此 % 則跳過不進場
+  leverage: 100
+  margin_type: "cross"
+  position_size_usdt: 100
+  position_size_pct: 2
+  max_open_positions: 2        # 最多 2 個倉位（BTC + ETH 各一），保留
+  stop_loss_pct: 3.0           # fallback 只用，實際止損由箱體邊界決定
+  take_profit_pct: 6.0         # 初始 TP 6%（TP1 由 4H MACD 觸發覆蓋）
+  max_daily_loss_pct: 100.0    # 停用（設為 100% 永不觸發）
+  max_daily_trades: 999        # 停用
+  consecutive_loss_pause: 999  # 停用
+  drawdown_stop_pct: 100       # 停用
+  anomaly_skip_pct: 100.0      # 停用
 
 # ===== 資金設定 =====
 capital:
-  total_usdt: 5000           # 總投入資金（USDT）
-  reserve_pct: 0             # 保留比例（0 = 不保留，全部可用）
-  compound: true             # 複利模式：true = 獲利自動滾入本金
+  total_usdt: 5000
+  reserve_pct: 0
+  compound: true
+  position_fixed_usdt: 100     # 每筆固定開倉 100U
 
 # ===== 執行設定 =====
 execution:
-  check_interval_seconds: 30   # 每幾秒檢查一次市場訊號
-  use_market_orders: true       # true = 市價單（即時成交），false = 限價單
-  slippage_tolerance_pct: 0.1  # 可接受的最大滑點百分比
+  check_interval_seconds: 30
+  use_market_orders: true
+  slippage_tolerance_pct: 0.1

@@ -42,42 +42,35 @@ class Exchange:
         if not api_key or not api_secret:
             raise ValueError(f"[連線失敗] 找不到 {mode_label} API 金鑰，請檢查 .env 檔案")
 
-        params = {
-            "apiKey": api_key,
-            "secret": api_secret,
+        base_opts = {
             "options": {
-                "defaultType": "future",  # USDT-M 合約
+                "defaultType": "future",
                 "recvWindow": 60000,
                 "adjustForTimeDifference": True,
-            },
+            }
         }
 
-        # Demo Trading 模式：使用 demo-fapi.binance.com
-        if self.is_testnet:
-            params["urls"] = {
-                "api": {
-                    "fapiPublic":    "https://demo-fapi.binance.com/fapi/v1",
-                    "fapiPrivate":   "https://demo-fapi.binance.com/fapi/v1",
-                    "fapiPublicV2":  "https://demo-fapi.binance.com/fapi/v2",
-                    "fapiPrivateV2": "https://demo-fapi.binance.com/fapi/v2",
-                    "fapiPublicV3":  "https://demo-fapi.binance.com/fapi/v3",
-                    "fapiPrivateV3": "https://demo-fapi.binance.com/fapi/v3",
-                }
-            }
+        # 私有物件（帶 auth，用於下單/帳戶）
+        private_params = {**base_opts, "apiKey": api_key, "secret": api_secret}
+        # 公開物件（不帶 auth，用於 K 線/報價），避免 demo-fapi 驗證 key 失敗
+        public_params = {**base_opts}
 
-        self.exchange = ccxt.binance(params)
+        self.exchange = ccxt.binance(private_params)
+        self._public = ccxt.binance(public_params)
 
-        # Demo Trading：覆寫所有 fapi 端點到 demo-fapi.binance.com
+        # Demo Trading：所有 fapi 端點指向 demo-fapi.binance.com
         if self.is_testnet:
             demo_base = "https://demo-fapi.binance.com"
-            for key in list(self.exchange.urls["api"].keys()):
-                if key.startswith("fapi"):
-                    version = "v2" if "V2" in key else ("v3" if "V3" in key else "v1")
-                    self.exchange.urls["api"][key] = f"{demo_base}/fapi/{version}"
+            for ex in [self.exchange, self._public]:
+                for k in list(ex.urls["api"].keys()):
+                    if k.startswith("fapi"):
+                        version = "v2" if "V2" in k else ("v3" if "V3" in k else "v1")
+                        ex.urls["api"][k] = f"{demo_base}/fapi/{version}"
 
-        # 載入市場資料（公開端點）
+        # 載入市場資料（公開端點，用 _public 物件）
         try:
-            self.exchange.load_markets()
+            self._public.load_markets()
+            self.exchange.markets = self._public.markets  # 同步市場資料
         except Exception as e:
             logger.warning(f"[load_markets] {e}，嘗試繼續...")
 
@@ -111,16 +104,16 @@ class Exchange:
         return self._retry(_fetch, "取得總餘額")
 
     def get_ticker(self, symbol: str) -> dict:
-        """取得當前報價"""
+        """取得當前報價（用公開物件，避免 demo-fapi auth 問題）"""
         return self._retry(
-            lambda: self.exchange.fetch_ticker(symbol),
+            lambda: self._public.fetch_ticker(symbol),
             f"取得報價 {symbol}"
         )
 
     def get_ohlcv(self, symbol: str, timeframe: str, limit: int = 100) -> pd.DataFrame:
-        """取得 K 線數據，回傳 DataFrame（含 open/high/low/close/volume）"""
+        """取得 K 線數據（用公開物件，避免 demo-fapi auth 問題）"""
         def _fetch():
-            raw = self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+            raw = self._public.fetch_ohlcv(symbol, timeframe, limit=limit)
             df = pd.DataFrame(raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
             df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
             df.set_index("timestamp", inplace=True)

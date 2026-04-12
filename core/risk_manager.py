@@ -34,6 +34,8 @@ class RiskManager:
         # 從 settings 載入風控參數
         self.leverage: int = self.risk_cfg["leverage"]
         self.position_size_pct: float = self.risk_cfg["position_size_pct"]
+        # 固定開倉金額（優先於百分比）
+        self.position_fixed_usdt: float = self.capital_cfg.get("position_fixed_usdt", 0.0)
         self.max_open_positions: int = self.risk_cfg["max_open_positions"]
         self.max_daily_loss_pct: float = self.risk_cfg["max_daily_loss_pct"]
         self.max_daily_trades: int = self.risk_cfg["max_daily_trades"]
@@ -163,22 +165,29 @@ class RiskManager:
 
     def calculate_position_size(self, balance: float, price: float) -> float:
         """
-        根據帳戶餘額與當前價格計算下單數量（幣數）。
-        使用 math.floor 取 3 位小數，避免因進位超出保證金限制。
+        計算下單數量（幣數）。
+
+        若設定 capital.position_fixed_usdt > 0 → 使用固定保證金（如 100 USDT）
+        否則 → 使用帳戶百分比計算
 
         公式：
-            margin  = balance * (position_size_pct / 100)
-            notional = margin * leverage
-            amount  = notional / price  → floor 至 3 位小數
+            margin   = position_fixed_usdt  （固定模式）
+                     = balance × position_size_pct / 100  （百分比模式）
+            notional = margin × leverage
+            amount   = notional / price  → floor 至 3 位小數
         """
-        margin = balance * (self.position_size_pct / 100)
-        notional = margin * self.leverage
+        if self.position_fixed_usdt > 0:
+            margin = self.position_fixed_usdt
+        else:
+            margin = balance * (self.position_size_pct / 100)
+
+        notional   = margin * self.leverage
         raw_amount = notional / price
-        # floor 至第 3 位小數（10^3 = 1000）
-        amount = math.floor(raw_amount * 1000) / 1000
+        amount     = math.floor(raw_amount * 1000) / 1000
+
         logger.debug(
-            f"[SHIELD] 倉位計算 | balance={balance:.2f} price={price:.2f} "
-            f"margin={margin:.2f} notional={notional:.2f} amount={amount:.3f}"
+            f"[SHIELD] 倉位計算 | margin={margin:.2f} USDT "
+            f"price={price:.2f} notional={notional:.2f} amount={amount:.3f}"
         )
         return amount
 

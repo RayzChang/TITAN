@@ -31,15 +31,16 @@ from core.exchange import Exchange
 from core.position_manager import PositionManager
 from core.risk_manager import RiskManager
 from scanner.market_scanner import MarketScanner
-from strategies.ema_crossover import EMAcrossover
+from strategies.range_breakout import RangeBreakout
 from utils.logger import get_logger
 
 load_dotenv()
 logger = get_logger()
 
-# 每次策略掃描取最近幾根 K 線
-# 200 根 x 15m = 50 小時，足夠 EMA-100 暖機
-KLINE_LIMIT = 200
+# K 線根數設定（各時間週期）
+KLINE_1H  = 200   # 1H  × 200 = 約 8 天，足夠 MACD 暖機
+KLINE_4H  = 100   # 4H  × 100 = 約 17 天，TP1/加倉確認
+KLINE_1D  = 120   # 1D  × 120 = 約 4 個月，箱體偵測用
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -67,7 +68,7 @@ class TitanBot:
         self.exchange = Exchange(settings)
         self.exchange.connect()
 
-        self.strategy  = EMAcrossover(settings)
+        self.strategy  = RangeBreakout(settings)
         self.scanner   = MarketScanner(self.exchange, settings)
         self.risk_mgr  = RiskManager(self.exchange, settings)
         self.pos_mgr   = PositionManager(self.exchange, settings)
@@ -206,6 +207,9 @@ class TitanBot:
             logger.warning(f"[TITAN] 取得幣種列表失敗：{e}")
             return
 
+        # ── Step 3a：持倉管理（TP1 / 減倉 / 加倉）──
+        self._manage_open_positions()
+
         signals_found = 0
         for symbol in symbols:
             if not self._running:
@@ -229,16 +233,25 @@ class TitanBot:
         if self.pos_mgr.is_in_position(symbol):
             return False
 
-        # 取 K 線
+        # 取多時間週期 K 線
         try:
-            df = self.exchange.get_ohlcv(symbol, self.timeframe, limit=KLINE_LIMIT)
+            df      = self.exchange.get_ohlcv(symbol, '1h',  limit=KLINE_1H)
+            df_4h   = self.exchange.get_ohlcv(symbol, '4h',  limit=KLINE_4H)
+            df_1d   = self.exchange.get_ohlcv(symbol, '1d',  limit=KLINE_1D)
         except Exception as e:
             logger.debug(f"[{symbol}] 取 K 線失敗：{e}")
             return False
 
-        if len(df) < 120:
-            logger.debug(f"[{symbol}] K 線不足（{len(df)} 根），跳過")
+        if len(df) < 40 or len(df_1d) < 30:
+            logger.debug(f"[{symbol}] K 線不足，跳過")
             return False
+
+        # 注入多時間週期資料至策略
+        self.strategy.update_data(df_4h, df_1d)
+
+        box_upper, box_lower = self.strategy.get_box()
+        if box_upper and box_lower:
+            logger.debug(f"[{symbol}] 箱體：{box_lower:.2f} ~ {box_upper:.2f} | 現價：{df['close'].iloc[-1]:.2f}")
 
         # 異常行情偵測（單根 K 線波動過大）
         if self.risk_mgr.check_anomaly(df.iloc[-1]):
@@ -371,8 +384,11 @@ class TitanBot:
                 pass
             return False
 
-        # 登記至倉位管理器
-        position_usdt = balance * (self.settings['risk']['position_size_pct'] / 100)
+        # 登記至倉位管理器（優先使用固定金額設定）
+        position_usdt = self.settings['capital'].get(
+            'position_fixed_usdt',
+            balance * (self.settings['risk']['position_size_pct'] / 100)
+        )
         self.pos_mgr.register_trade(
             symbol        = symbol,
             side          = trade_signal,
@@ -385,6 +401,105 @@ class TitanBot:
 
         logger.info(f"[開倉成功] {symbol} 開{direction} | 保證金：${position_usdt:.2f}")
         return True
+
+    # ── 持倉管理（TP1 / 減倉 / 加倉）────────────────────────────────
+    def _manage_open_positions(self):
+        """
+        對所有現有持倉執行管理動作：
+        - TP1  : 4H MACD 反向交叉 → 取消現有 TP，平掉一半，止損移至開倉價
+        - reduce: 日線 MACD 反向  → 減半倉（警示）
+        - addon : 4H 連續確認     → 加倉同方向 100U
+        """
+        active_positions = self.pos_mgr.get_active_positions()
+        if not active_positions:
+            return
+
+        for symbol, pos in active_positions.items():
+            signal = pos.get('side', '')
+            if not signal:
+                continue
+
+            # 注入最新多時間週期資料（讓策略計算最新 MACD 狀態）
+            try:
+                df_4h = self.exchange.get_ohlcv(symbol, '4h', limit=KLINE_4H)
+                df_1d = self.exchange.get_ohlcv(symbol, '1d', limit=KLINE_1D)
+                self.strategy.update_data(df_4h, df_1d)
+            except Exception as e:
+                logger.debug(f"[{symbol}] 持倉管理取 K 線失敗：{e}")
+                continue
+
+            action = self.strategy.get_management_action(symbol, signal)
+
+            # ── TP1：止盈一半 + 止損移至開倉價 ──────────────────────
+            if action.get('tp1'):
+                logger.info(f"[管理] {symbol} TP1 觸發（4H MACD 反向）→ 平倉一半，止損移至開倉價")
+                try:
+                    entry_price = pos.get('entry_price', 0)
+                    amount      = pos.get('amount', 0)
+                    half_amount = amount / 2
+                    close_side  = 'sell' if signal == 'LONG' else 'buy'
+
+                    # 平倉一半
+                    self.exchange.create_order(
+                        symbol     = symbol,
+                        order_type = 'market',
+                        side       = close_side,
+                        amount     = half_amount,
+                        params     = {'reduceOnly': True},
+                    )
+                    logger.info(f"[管理] {symbol} TP1 平倉一半成功 ({half_amount})")
+
+                    # 取消舊止損單，補新止損（移至開倉價）
+                    try:
+                        self.exchange.cancel_all_orders(symbol)
+                    except Exception:
+                        pass
+
+                    new_sl = self.strategy.get_stop_loss(entry_price, signal)
+                    # 移至開倉價（保本止損）
+                    breakeven_sl = entry_price
+                    self.exchange.create_order(
+                        symbol     = symbol,
+                        order_type = 'stop_market',
+                        side       = close_side,
+                        amount     = half_amount,
+                        params     = {
+                            'stopPrice':     breakeven_sl,
+                            'reduceOnly':    True,
+                            'closePosition': False,
+                        },
+                    )
+                    logger.info(f"[管理] {symbol} 止損移至開倉價 {breakeven_sl:.2f}")
+                except Exception as e:
+                    logger.warning(f"[管理] {symbol} TP1 執行失敗：{e}")
+
+            # ── reduce：日線 MACD 反向，提示減倉 ─────────────────────
+            if action.get('reduce'):
+                logger.info(f"[管理] {symbol} 日線 MACD 反向！建議減半倉（人工確認）")
+
+            # ── addon：加倉 ───────────────────────────────────────────
+            if action.get('addon'):
+                logger.info(f"[管理] {symbol} 加倉條件觸發（4H 連續 {self.strategy.addon_candles} 根確認）")
+                try:
+                    ticker      = self.exchange.get_ticker(symbol)
+                    entry_price = float(ticker['last'])
+                    balance     = (
+                        self.exchange.get_total_balance()
+                        if self.compound
+                        else float(self.settings['capital']['total_usdt'])
+                    )
+                    amount = self.risk_mgr.calculate_position_size(balance, entry_price)
+                    side   = 'buy' if signal == 'LONG' else 'sell'
+
+                    self.exchange.create_order(
+                        symbol     = symbol,
+                        order_type = 'market',
+                        side       = side,
+                        amount     = amount,
+                    )
+                    logger.info(f"[管理] {symbol} 加倉成功 {amount} @ {entry_price:.2f}")
+                except Exception as e:
+                    logger.warning(f"[管理] {symbol} 加倉失敗：{e}")
 
     # ── 每日報告 + 重置 ────────────────────────────────────────────────
 

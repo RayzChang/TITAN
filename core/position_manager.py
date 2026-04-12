@@ -274,6 +274,20 @@ class PositionManager:
     def get_active_symbols(self) -> list:
         return list(self.active_trades.keys())
 
+    def get_active_positions(self) -> dict:
+        """
+        回傳所有當前持倉的關鍵資訊。
+        格式：{ symbol: {'side': 'LONG'/'SHORT', 'entry_price': float, 'amount': float} }
+        """
+        return {
+            symbol: {
+                'side':        trade.side,
+                'entry_price': trade.entry_price,
+                'amount':      trade.amount,
+            }
+            for symbol, trade in self.active_trades.items()
+        }
+
     def get_session_summary(self) -> dict:
         """本次 session 所有已平倉交易的統計摘要"""
         trades = self.closed_trades

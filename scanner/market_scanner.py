@@ -43,6 +43,15 @@ class MarketScanner:
 
     def get_tradeable_symbols(self) -> list[str]:
         """取得今日可交易幣種清單（有快取則直接回傳）"""
+        # manual 模式：直接使用設定檔指定的幣種
+        if self.symbols_cfg.get('mode') == 'manual':
+            manual_list = self.symbols_cfg.get('list', [])
+            if manual_list:
+                if not self._cache:
+                    logger.info(f"[掃描] 手動模式，幣種：{', '.join(manual_list)}")
+                    self._cache = manual_list
+                return self._cache
+
         today = date.today()
         if self._cache and self._cache_date == today:
             return self._cache
