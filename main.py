@@ -100,6 +100,9 @@ class TitanBot:
         # 預先設定所有幣種的槓桿與保證金模式
         self._setup_symbols()
 
+        # 初始化每個 symbol 的箱體（手動 or 自動）
+        self._init_boxes()
+
         # 立即執行一次初始掃描，確認系統正常
         logger.info("[TITAN] 執行初始掃描...")
         self.run_cycle()
@@ -249,17 +252,32 @@ class TitanBot:
         # 注入多時間週期資料至策略
         self.strategy.update_data(df_4h, df_1d)
 
-        box_upper, box_lower = self.strategy.get_box()
+        box_upper, box_lower = self.strategy.get_box(symbol)
         if box_upper and box_lower:
-            logger.debug(f"[{symbol}] 箱體：{box_lower:.2f} ~ {box_upper:.2f} | 現價：{df['close'].iloc[-1]:.2f}")
+            box_detail = self.strategy.get_box_detail(symbol)
+            ceilings   = box_detail.get('ceilings', [box_upper])
+            ceil_str   = ' / '.join([str(c) for c in ceilings])
+            logger.debug(
+                f"[{symbol}] floor={box_lower:.2f} | "
+                f"ceilings=[{ceil_str}] | 現價={df['close'].iloc[-1]:.2f}"
+            )
 
         # 異常行情偵測（單根 K 線波動過大）
         if self.risk_mgr.check_anomaly(df.iloc[-1]):
             return False
 
+        # 更新箱體狀態（延伸上緣 / 失效偵測）
+        last_bar = df.iloc[-1]
+        self.strategy.update_box(
+            symbol         = symbol,
+            current_high   = float(last_bar['high']),
+            current_close  = float(last_bar['close']),
+            current_volume = float(last_bar['volume']),
+        )
+
         # 計算訊號
         try:
-            trade_signal = self.strategy.calculate_signals(df)
+            trade_signal = self.strategy.calculate_signals(df, symbol)
         except Exception as e:
             logger.warning(f"[{symbol}] 策略計算失敗：{e}")
             return False
@@ -325,9 +343,9 @@ class TitanBot:
         if amount <= 0:
             return False
 
-        # SL / TP（使用策略計算，保留未來 ATR 擴展能力）
-        sl_price = self.strategy.get_stop_loss(entry_price, trade_signal)
-        tp_price = self.strategy.get_take_profit(entry_price, trade_signal)
+        # SL / TP
+        sl_price = self.strategy.get_stop_loss(entry_price, trade_signal, symbol)
+        tp_price = self.strategy.get_take_profit(entry_price, trade_signal, symbol)
 
         # 下單方向設定
         side       = 'buy'  if trade_signal == 'LONG' else 'sell'
@@ -611,6 +629,20 @@ class TitanBot:
         )
 
     # ── 初始化輔助 ────────────────────────────────────────────────────
+
+    def _init_boxes(self):
+        """啟動時為每個 symbol 初始化箱體（手動 or 自動偵測）"""
+        try:
+            symbols = self.scanner.get_tradeable_symbols()
+        except Exception:
+            return
+        for symbol in symbols:
+            try:
+                df_1d = self.exchange.get_ohlcv(symbol, '1d', limit=KLINE_1D)
+                self.strategy.init_box(symbol, df_1d)
+            except Exception as e:
+                logger.warning(f"[{symbol}] 箱體初始化失敗：{e}")
+                self.strategy.init_box(symbol)
 
     def _setup_symbols(self):
         """預先設定所有可交易幣種的槓桿與保證金模式"""

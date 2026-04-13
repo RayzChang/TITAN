@@ -24,6 +24,15 @@ strategy:
     addon_candles: 3           # 加倉確認：連續幾根 4H K 棒
     breakdown_vol_min: 1.5     # 箱體失效需要的最低量比
 
+    # 手動初始箱體（以朋友畫的為基準，失效後由程式自動偵測新箱體）
+    manual_boxes:
+      "BTC/USDT":
+        floor: 60300           # 原始箱體下緣（永久支撐）
+        ceilings: [74000, 76188]  # 歷史延伸上緣（由低到高）
+      "ETH/USDT":
+        floor: 1740            # 原始箱體下緣
+        ceilings: [2100, 2400]    # 小箱上緣 + 大箱上緣
+
 # ===== 風險管理 =====
 # 注意：風控暫時全部拔掉（2026-04-12 決定），改跑 3 天 testnet 觀察
 risk:
