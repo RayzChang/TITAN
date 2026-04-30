@@ -33,3 +33,9 @@ Thumbs.db
 # 保留資料夾結構
 !data/.gitkeep
 !logs/.gitkeep
+
+# Runtime artifacts（執行期產生，不進版控）
+state.json
+.claude/scheduled_tasks.lock
+.claude/settings.local.json
+data/_archive/
