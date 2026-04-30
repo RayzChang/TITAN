@@ -1,154 +1,146 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/TITAN-v1.1-blue?style=for-the-badge&logo=bitcoin&logoColor=white" alt="TITAN v1.1"/>
+  <img src="https://img.shields.io/badge/TITAN-R3 v1.0-blue?style=for-the-badge&logo=bitcoin&logoColor=white" alt="TITAN R3 v1.0"/>
   <img src="https://img.shields.io/badge/Python-3.14-green?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.14"/>
   <img src="https://img.shields.io/badge/Binance-Futures-yellow?style=for-the-badge&logo=binance&logoColor=white" alt="Binance Futures"/>
-  <img src="https://img.shields.io/badge/Phase-3%20Live-brightgreen?style=for-the-badge" alt="Phase 3 Live"/>
+  <img src="https://img.shields.io/badge/Phase-5%20Spec%20Lock-brightgreen?style=for-the-badge" alt="Phase 5 Spec Lock"/>
   <img src="https://img.shields.io/badge/License-MIT-red?style=for-the-badge" alt="MIT License"/>
 </p>
 
-<h1 align="center">TITAN v1</h1>
+<h1 align="center">TITAN R3</h1>
 <h3 align="center">Trading Intelligent Tactical Automation Network</h3>
-<p align="center"><b>交易智能戰術自動化網絡</b></p>
+<p align="center"><b>Regime Filter · Risk Engine · Return Targeting</b></p>
 
 <p align="center">
-  全自動幣安 USDT-M 合約交易機器人<br/>
-  專為紀律型交易者打造 — 嚴守止盈止損，複利滾倉，穩健獲利
+  全自動幣安 USDT-M 永續合約交易系統<br/>
+  以 Regime 路由 + 多策略互補 + 7 層驗證為核心，追求穩健日均收益
 </p>
 
 ---
 
 ## 目前狀態
 
-| 項目 | 狀態 |
-|------|------|
+| 階段 | 狀態 |
+|---|---|
 | Phase 1 基礎建設 | ✅ 完成 |
-| Phase 2 策略 + 回測 | ✅ 完成 |
-| Phase 3 Demo 實盤模擬 | ✅ 完成（交易迴圈已上線） |
-| Phase 4 正式上線 | ⏳ 待定 |
+| Phase 2 策略 + 回測引擎 | ✅ 完成 |
+| Phase 3 Demo 實盤模擬（V1.x） | ✅ 完成 (Sunset) |
+| Phase 4 策略迭代（V1.1 → V2 / 朋友箱體） | ✅ 完成 (Sunset) |
+| **Phase 5 R3 Spec Lock** | ✅ **完成 (2026-04-30)** |
+| Sprint 1 — 基礎設施升級 | 🔄 待啟動 |
+| Sprint 2-5 — R3 完整實作 | ⏳ 待定 |
+| Phase 6 Dry-run 30 天 | ⏳ 待定 |
+| Phase 7 Canary live | ⏳ 待定 |
 
-**當前策略版本：V1.1**（EMA 交叉 + RSI + 趨勢濾網 + 成交量濾網）
+**當前策略版本**：R3 v1.0 — 規格已鎖檔，進入工程實作階段
 
----
+**規格文件**：[`docs/R3_spec.md`](docs/R3_spec.md)
 
-## 簡介
-
-**TITAN** 是一款全自動化的幣安永續合約交易機器人，基於技術指標策略（EMA 交叉 + RSI 過濾）執行交易，搭配嚴格的風控系統與複利機制，追求長期穩定正向收益。
-
-核心理念：**紀律 > 預測，風控 > 獲利，複利 > 重倉**
-
----
-
-## 特色功能
-
-| 功能 | 說明 |
-|------|------|
-| **自動交易** | 24/7 全自動監控市場、產生訊號、執行下單 |
-| **市值動態掃描** | 透過 CoinGecko 追蹤真實市值前 20 大幣種，交叉比對幣安合約可用性 |
-| **多重過濾策略** | EMA 交叉 + RSI + 長期趨勢濾網（EMA-100）+ 成交量確認 |
-| **嚴格風控** | 止損止盈、日損限制、連續虧損暫停、帳戶回撤保護 |
-| **複利機制** | `compound: true` 時每次以最新帳戶餘額計算倉位，獲利自動滾入本金 |
-| **倉位監控** | PositionManager 即時追蹤持倉，自動偵測 SL/TP 觸發並記錄損益 |
-| **每日報告** | UTC 00:01 自動輸出損益/勝率/逐筆明細（繁體中文格式） |
-| **優雅關閉** | Ctrl+C 自動強制平倉 → 輸出最終報告 → 安全退出 |
-| **Demo 模式** | 支援幣安 Demo Trading，用真實行情完整驗證策略 |
-| **事件驅動回測** | 嚴格防止 lookahead bias，訊號在 K 線 i，成交在 K 線 i+1 開盤價 |
+**參數設定**：[`config/r3_strategy.yaml`](config/r3_strategy.yaml)
 
 ---
 
-## 策略說明（V1.1 當前版本）
-
-### EMA 交叉 + RSI + 趨勢濾網 + 成交量濾網
-
-**進場邏輯：**
+## R3 是什麼
 
 ```
-做多條件（全部需滿足）：
-  1. EMA-9 上穿 EMA-21（Golden Cross）
-  2. RSI 介於 35-65（縮緊，避免追高追低）
-  3. 收盤價 > EMA-100（確認大方向向上）
-  4. 本根成交量 > 20根均量 × 1.2（量能確認突破）
-
-做空條件（全部需滿足）：
-  1. EMA-9 下穿 EMA-21（Death Cross）
-  2. RSI 介於 35-65
-  3. 收盤價 < EMA-100（確認大方向向下）
-  4. 本根成交量 > 20根均量 × 1.2
+R3 = Regime Filter + Risk Engine + Return Targeting
 ```
 
-**止損止盈：**
+不再追求「找到一個神策略」，而是設計一個**會自己判斷市場狀態、會控制風險、會追蹤目標收益**的系統。
 
-```
-止損：入場價 ± 1.5%（底板，ATR 模式只放大不縮小）
-止盈：入場價 ± 3.0%（底板，報酬風險比 2:1）
-```
-
-**V1.1 相較 V1.0 改動：**
-- RSI 閾值縮緊：70/30 → 65/35（減少假突破）
-- 新增 EMA-100 趨勢濾網（只順大方向交易）
-- 新增成交量濾網（量能不足不進場）
-
-| 參數 | 數值 |
-|------|------|
-| 快線 EMA | 9 週期 |
-| 慢線 EMA | 21 週期 |
-| 趨勢 EMA | 100 週期 |
-| RSI 週期 | 14（閾值 35-65） |
-| 成交量均線 | 20 週期（需超過 1.2x） |
-| K 線週期 | 15 分鐘 |
+| 軸線 | 設計理念 |
+|---|---|
+| **Regime Filter** | 先判斷現在是趨勢、盤整、極端擁擠還是高風險，**不在所有市場下都交易** |
+| **Risk Engine** | 每筆固定百分比風險，**槓桿是「停損距離 + 風險」反推的結果**，不是設計變數 |
+| **Return Targeting** | 用交易頻率 × R 值追求日均 50–150 USDT，**不靠高槓桿賭單筆爆擊** |
 
 ---
 
-## 回測結果（V1.1 × 市值前 20 × 30 天）
+## 策略架構
 
-> 回測區間：2026 年 3 月 - 4 月（BTC 從 $88K 下跌至 $74K，強烈熊市）
-
-| 幣種 | 報酬率 | 勝率 | 交易數 |
-|------|--------|------|--------|
-| XLM | +21.68% | — | — |
-| SUI | +17.32% | — | — |
-| HBAR | +14.79% | — | — |
-| BNB | +4.90% | — | — |
-| BTC | +4.13% | — | — |
-| LINK | +1.30% | — | — |
-| *(13 others)* | 負報酬 | — | — |
+### 四象限 Regime 分類
 
 ```
-正向獲利幣種：7 / 20
-30 天總交易次數：~366 筆（平均每日 12.2 筆）
-平均報酬率：-5.50%（熊市環境）
+                    ┌─────────────────────────────┐
+                    │   Regime Classifier (4H)    │
+                    └──────────────┬──────────────┘
+                                   │
+                ┌──────┬───────────┼───────────┬──────┐
+                │      │           │           │      │
+              [A]    [B]         [C]         [D1]   [D2]
+            趨勢盤  盤整盤    極端擁擠盤   市場風險  系統風險
+                │      │           │           │      │
+                ▼      ▼           ▼           ▼      ▼
+           趨勢回踩  均值回歸  Funding反轉  Emergency  系統保命
+                                            Tight Stop  退出
 ```
 
-> **注意：** 回測期間為近期最差行情，EMA 交叉為落後指標，在急跌行情中較不利。策略框架健全，待中性/多頭行情驗證。
+### 三策略互補
+
+| 策略 | 啟動條件 | 風險上限 |
+|---|---|---|
+| **趨勢回踩續行** | Regime A：4H ADX>22 + EMA50/200 排列 | 1.5% |
+| **均值回歸** | Regime B：4H ADX<18 + 價格貼 EMA200 | 1.0% |
+| **Funding 反轉** | Regime C：funding_z > 2.5 + premium 過熱 | 0.75% |
+
+組合 portfolio 上限：**1.5%（首發保守版）**
+
+### 7 層驗證 L0–L6
+
+```
+L0 純回測 → L1 Walk-Forward → L2 MCPT (5000 路徑)
+   → L3 Block Bootstrap → L4 Bonferroni + DSR + PBO/CSCV
+   → L5 最終 OOS（不可調參） → L6 Regime 分層
+```
+
+通過 7 層才能進 Shadow → Dry-run → Canary → Scale-up。
 
 ---
 
-## 交易參數
+## 關鍵參數（首發版本 phase1_conservative）
 
-| 參數 | 預設值 | 說明 |
-|------|--------|------|
-| 保證金模式 | Cross（全倉） | 全倉模式，共享保證金 |
-| 槓桿 | 20x | 固定槓桿倍數 |
-| 單筆倉位 | 總資金 10% | 每筆交易使用的保證金比例（約 $500） |
-| 止損 | 1.5% | 價格反向 1.5% 自動平倉（約 $150 單筆虧損） |
-| 止盈 | 3.0% | 價格正向 3.0% 自動平倉（約 $300 單筆獲利） |
-| 報酬風險比 | 2:1 | 止盈為止損的 2 倍 |
-| 最大同時持倉 | 3 | 最多同時持有 3 個倉位 |
-| 每日最大交易 | 20 次 | 超過則當日停止交易 |
-| 複利 | 開啟 | 獲利自動滾入本金 |
+| 項目 | 值 |
+|---|---|
+| 標的 | `BTC/USDT:USDT`、`ETH/USDT:USDT` 永續 |
+| 主訊號 | 1H |
+| 大方向 | 4H |
+| 進出場 | 5M |
+| 單筆風險 | 0.75% × equity |
+| 同時最大風險 | 1.5% |
+| 每日虧損上限 | -2% |
+| 連續虧損 | 連虧 2 → 風險 ×0.5；連虧 4 → 當日停止 |
+| BTC+ETH Haircut | 同方向合併 ≤ 1% |
+| 進場執行 | Limit Maker → Taker fallback（4 條件全成立才允許） |
+| 限價 timeout | 2 根 5M K（10 分鐘）→ cancel；不允許 chase |
+| 停損 | confirmed pivot (1H, N=5) − 0.2 ATR；fallback 1.8 ATR |
+| 停利 | TP1 = 1R 出 50%；TP2 = 2.5–3R + trailing |
+
+詳見 [`docs/R3_spec.md`](docs/R3_spec.md) §4–§9。
 
 ---
 
-## 風控系統
+## 工程紀律
 
-TITAN 內建多層風控保護機制：
+R3 專案有 **5 條鐵律**，違反任一條視為破壞規範：
 
-```
-第 1 層 ─ 單筆止損          價格反向 1.5% 自動平倉
-第 2 層 ─ 日損限制          單日虧損達 5% 停止所有交易
-第 3 層 ─ 連續虧損暫停      連續 3 筆虧損 → 暫停交易 1 小時
-第 4 層 ─ 帳戶回撤保護      帳戶從高點回撤 20% → 停止所有交易
-第 5 層 ─ 異常行情跳過      單根 K 線波動 >5% → 不進場
-```
+1. ✅ 所有規則寫進 `docs/R3_spec.md`
+2. ✅ 所有 magic number 集中於 `config/r3_strategy.yaml`，不允許 hardcode
+3. ✅ 單元測試覆蓋 Q21–Q29（`tests/test_r3.py`）
+4. ✅ 上線前必須通過 L0–L6 全部驗證
+5. ❌ **驗證 Fail 時禁止偷偷調參讓它通過**
+
+---
+
+## R3 開發路線圖
+
+| Sprint | 工作內容 | 預估工時 |
+|---|---|---|
+| 1 | 5m 資料載入、funding/premium API、指標庫（BB/VWAP/Funding Z/Pivot） | 5 天 |
+| 2 | Regime Classifier（A/B/C/D 切換邏輯） | 5 天 |
+| 3 | 趨勢回踩主策略 + Limit Maker 訂單管理 + L0–L6 全跑 | 7 天 |
+| 4 | 均值回歸主策略 + Strategy Router | 5 天 |
+| 5 | Funding Reversal 副策略 | 3 天 |
+
+→ Dry-run 30 天 → Canary 小資金 → Scale-up
 
 ---
 
@@ -156,44 +148,78 @@ TITAN 內建多層風控保護機制：
 
 ```
 TITAN/
-├── main.py                       # 程式進入點
-├── run_backtest.py               # 全市值前 20 回測腳本
-├── requirements.txt              # Python 依賴套件
-├── .env.example                  # 環境變數範本
+├── main.py                       # live trading 主程式
+├── state.json                    # 即時持倉快照
+├── README.md / 策略.md           # 專案說明 + 策略對照
+├── requirements.txt / .env       # 依賴 + API key
 │
 ├── config/
-│   ├── settings.yaml             # 交易參數設定（繁體中文註解）
-│   └── settings_loader.py        # 設定檔載入與驗證
+│   ├── settings.yaml             # V1 設定（V1 系列現役）
+│   ├── settings_loader.py
+│   └── r3_strategy.yaml          # ★ R3 參數 source of truth
 │
-├── scanner/
-│   ├── market_scanner.py         # 市值前 20 大幣種動態掃描（CoinGecko）
-│   └── symbol_filter.py          # 篩選幣安可交易合約幣種
-│
-├── core/
-│   ├── exchange.py               # 交易所連線（ccxt 封裝）
-│   ├── order_manager.py          # 下單 / 改單 / 取消管理
-│   ├── position_manager.py       # 倉位追蹤與損益計算
-│   └── risk_manager.py           # 風控引擎（多層保護）
+├── core/                         # live trading 核心
+│   ├── exchange.py               # 幣安 API 封裝（公開/私有客戶端分離）
+│   ├── order_manager.py          # 下單封裝
+│   ├── position_manager.py       # 持倉同步（含 3 層 sync 防護）
+│   ├── risk_manager.py           # 風控（日虧、連虧、回撤）
+│   └── state_store.py            # state.json 持久化
 │
 ├── strategies/
-│   ├── base_strategy.py          # 策略抽象基類
-│   └── ema_crossover.py          # EMA 交叉 + RSI + 趨勢 + 成交量策略（V1.1）
+│   ├── base_strategy.py
+│   ├── candidates.py             # V1 / V2 系列（保留為對照組）
+│   ├── range_breakout.py         # 朋友箱體 v1.6
+│   ├── _legacy/                  # ema_crossover, momentum_breakout
+│   └── r3/                       # ★ R3 模組
+│       ├── config_loader.py      # ✓ 已實作
+│       ├── indicators.py         # Sprint 1
+│       ├── regime.py             # Sprint 2
+│       ├── confirmation.py
+│       ├── risk_engine.py
+│       ├── trailing.py
+│       ├── executor.py
+│       ├── trend_pullback.py     # Sprint 3
+│       ├── mean_reversion.py     # Sprint 4
+│       ├── funding_reversal.py   # Sprint 5
+│       └── router.py
 │
-├── indicators/
-│   └── technical.py              # 技術指標計算（EMA/RSI/BB/MACD/ATR）
+├── indicators/technical.py       # 技術指標庫
+├── scanner/                      # 多幣掃描
+├── utils/logger.py
 │
 ├── backtest/
-│   ├── engine.py                 # 事件驅動回測引擎（防 lookahead bias）
-│   ├── data_loader.py            # 歷史 K 線數據載入與快取
-│   └── report.py                 # 回測績效報告產生
+│   ├── data_loader.py / report.py
+│   ├── engine_portfolio.py       # 上一代 portfolio 引擎
+│   ├── engine_portfolio_v2.py    # ★ V2 引擎（Active/Shadow + RICK 風控）
+│   └── _legacy/
 │
-├── utils/
-│   ├── logger.py                 # 日誌系統（繁體中文）
-│   ├── notifier.py               # 通知推播（Telegram/Line）
-│   └── helpers.py                # 工具函式
+├── tools/
+│   ├── validate_v2.py / validate_cross.py
+│   ├── mcpt_portfolio_v2.py / walk_forward_v2.py
+│   ├── backtest_top20_strategies.py
+│   ├── account/                  # check_account, check_leverage_bracket
+│   └── _legacy/
 │
-├── data/                         # 歷史數據快取
-└── logs/                         # 運行日誌
+├── tests/
+│   └── test_r3.py                # ★ Q21–Q29 單元測試（34 cases）
+│
+├── data/
+│   ├── *_1h.csv / *_4h.csv / *_1d.csv
+│   ├── *_results.json
+│   └── _archive/                 # 歷史 15m + 舊 backtest_trades
+│
+├── logs/
+│   ├── titan.log + 最近 5 天
+│   └── archive/                  # 04-04 ~ 04-23
+│
+├── docs/
+│   ├── R3_spec.md                # ★ R3 規格 v1.0（鎖檔）
+│   ├── TITAN_v1.3_spec.md
+│   └── manus_momentum_funding_report.md
+│
+└── .claude/commands/
+    ├── ship.md                   # /ship — 標準推送流程
+    └── spec-lock.md              # /spec-lock — 策略規格鎖定流程
 ```
 
 ---
@@ -207,7 +233,7 @@ git clone https://github.com/RayzChang/TITAN.git
 cd TITAN
 
 python -m venv .venv
-.venv\Scripts\activate        # Windows
+.venv\Scripts\activate         # Windows
 pip install -r requirements.txt
 ```
 
@@ -224,66 +250,39 @@ BINANCE_DEMO_API_KEY=你的_Demo_API_Key
 BINANCE_DEMO_API_SECRET=你的_Demo_API_Secret
 ```
 
-### 3. 調整交易參數
-
-編輯 `config/settings.yaml`，所有參數皆有繁體中文註解。
-
-### 4. 執行回測
+### 3. 跑 R3 單元測試（驗證 spec ↔ config 一致性）
 
 ```bash
-python run_backtest.py
+.venv/Scripts/python -m pytest tests/test_r3.py -v
+# → 11 passed, 23 skipped (skipped 為待 Sprint 1+ 實作的 logic tests)
 ```
 
-### 5. 啟動機器人（Demo 模式）
+### 4. 跑 V1 / V2 / 箱體回測（現役對照）
 
 ```bash
-# settings.yaml 中 mode: "testnet"（預設）
-python main.py
+.venv/Scripts/python tools/validate_v2.py     # V2 完整驗證
+.venv/Scripts/python tools/validate_cross.py  # V1 vs V1-CROSS-100X 對比
+```
+
+### 5. 啟動 V1 機器人（Demo 模式，R3 實作完成前的過渡方案）
+
+```bash
+.venv/Scripts/python main.py
 ```
 
 ---
 
-## 複利效果預估
+## 歷史策略沿革（Sunset）
 
-以每日淨收益 1% 為例：
-
-```
-Day 1   ─  $5,000
-Day 7   ─  $5,355   (+7.1%)
-Day 30  ─  $6,739   (+34.8%)
-Day 90  ─  $12,135  (+142.7%)
-Day 180 ─  $29,460  (+489.2%)
-```
-
-> 複利的力量在於時間。紀律執行，讓利潤自己成長。
-
----
-
-## 迭代規劃
-
-| 版本 | 週期 | 重點 | 狀態 |
-|------|------|------|------|
-| V1.0 | Day 1-3 | 基礎建設 + 策略初版 | ✅ |
-| V1.1 | Day 4-6 | 回測分析、策略第一輪優化（趨勢+成交量濾網） | ✅ |
-| V1.2 | Day 7-9 | ATR 動態止損實驗、回測再驗證 | ✅ |
-| V1.3 | Day 10-12 | Demo 完整交易迴圈上線（倉位管理、複利、每日報告） | ✅ |
-| V1.4 | Day 13-15 | Demo 數據分析、策略微調 | 🔄 |
-| V1.5+ | Day 16+ | 穩定性強化、正式上線準備 | ⏳ |
-
----
-
-## 技術棧
-
-| 項目 | 技術 |
-|------|------|
-| 語言 | Python 3.14 |
-| 交易所 API | [ccxt](https://github.com/ccxt/ccxt) |
-| 技術指標 | [ta](https://github.com/bukosabino/ta) |
-| 數據處理 | pandas, numpy |
-| 市值排名 | CoinGecko Free API |
-| 設定管理 | PyYAML |
-| 排程 | APScheduler |
-| 環境變數 | python-dotenv |
+| 版本 | 重點 | 歸宿 |
+|---|---|---|
+| V1.0 | EMA 交叉 + RSI | 歸檔 → `strategies/_legacy/ema_crossover.py` |
+| V1.1 | + 趨勢濾網 + 成交量濾網 | MCPT 通過率不及 V1，棄用 |
+| V1.2A/B/C | ADX / ATR 變體 | 改善有限，棄用 |
+| V1-CROSS-100X | + RICK 風控 | 通過 cross 驗證，保留為對照 |
+| V2-SL-075/100/DYN | Aggressive Passive | 待 V2 portfolio 驗證完成 |
+| Range Breakout v1.6 | 朋友箱體 + 層疊 | 現役（共存） |
+| **R3 v1.0** | **Regime + Risk + Return** | **★ 主路線** |
 
 ---
 
@@ -292,11 +291,13 @@ Day 180 ─  $29,460  (+489.2%)
 | 代號 | 角色 | 職責 |
 |------|------|------|
 | **RAYZ** | BOSS | 專案擁有者，最終決策 |
-| **MIA** | 總指揮 + 策略長 | 統籌全局、策略設計、程式碼整合 |
+| **MIA** | 總指揮 + 策略長 | 統籌全局、策略設計、程式碼整合、規格鎖定 |
 | **SAM** | 策略研究員 | 技術指標研究、參數優化 |
-| **REX** | 回測工程師 | 歷史回測、績效報告 |
-| **QA** | 測試工程師 | 品質保證、穩定性測試 |
+| **REX** | 回測工程師 | 歷史回測、L0–L6 驗證 |
+| **QA** | 測試工程師 | 單元測試、穩定性測試 |
 | **SHIELD** | 風控官 | 風險控管、安全機制 |
+
+外部協作：**RICK**（OpenAI Agent，用於跨模型 cross-validation）、**Manus**（量化驗證對照）。
 
 ---
 
@@ -313,6 +314,6 @@ Day 180 ─  $29,460  (+489.2%)
 ---
 
 <p align="center">
-  <b>TITAN v1</b> — Built by MIA Team, Powered by Discipline<br/>
-  <i>紀律是獲利的基石，複利是時間的禮物</i>
+  <b>TITAN R3</b> — Built by MIA Team, Powered by Discipline<br/>
+  <i>不靠槓桿賭運氣，靠 Regime 判斷 + 風險工程站著賺</i>
 </p>

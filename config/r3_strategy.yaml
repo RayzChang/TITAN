@@ -1,0 +1,515 @@
+# =============================================================
+# R3 Crypto Futures Strategy — 參數設定檔
+# Spec : docs/R3_spec.md (v1.0)
+# Lock : 2026-04-30
+# =============================================================
+# 規則：所有 magic number 都在這個檔案。策略邏輯內禁止 hardcode。
+# 修改時請同步更新 docs/R3_spec.md 並開新版號。
+# =============================================================
+
+version: "1.0"
+spec_ref: "docs/R3_spec.md"
+
+# -------------------------------------------------------------
+# 1. 交易標的
+# -------------------------------------------------------------
+universe:
+  phase1_initial:
+    - "BTC/USDT:USDT"
+    - "ETH/USDT:USDT"
+  phase2_after_stable:
+    - "SOL/USDT:USDT"
+  active_phase: "phase1_initial"
+
+# -------------------------------------------------------------
+# 2. 時框
+# -------------------------------------------------------------
+timeframes:
+  trend_filter: "4h"
+  signal:       "1h"
+  execution:    "5m"
+  d2_monitor:   "1m"
+
+# -------------------------------------------------------------
+# 3. Regime Filter (§3)
+# -------------------------------------------------------------
+regime:
+  # ----- A 趨勢盤 -----
+  a_trend:
+    adx_4h_min: 22
+    funding_z_abs_max: 2.5
+
+  # ----- B 盤整盤 -----
+  b_range:
+    adx_4h_max: 18
+    price_band_atr_4h_mult: 0.5
+    bb_width_percentile_low: 10
+    bb_width_percentile_high: 50
+    funding_z_abs_max: 1.0
+
+  # ----- C 極端擁擠 -----
+  c_extreme:
+    funding_z_threshold: 2.5
+    premium_z_threshold: 2.0
+
+  # ----- D1 市場風險 -----
+  d1_market:
+    consecutive_large_candles: 2
+    large_candle_atr_mult: 2.5
+    funding_z_abs_panic: 3.0
+    daily_loss_pct_stop: -2.0
+    consecutive_loss_count_stop: 4
+
+  # ----- D2 系統風險 -----
+  d2_system:
+    api_latency_seconds_max: 2.0
+    api_latency_consecutive_count: 3
+    websocket_disconnect_grace_sec: 5
+
+  # ----- 切換頻率 -----
+  update_frequency:
+    ab_switch:        "on_4h_candle_close"
+    d1_market:        "on_1h_candle_close_or_faster"
+    d2_system:        "realtime"
+
+  # ----- A→B 切換處理 (Q1, Q16) -----
+  ab_switch_action:
+    cancel_pending_orders: false
+    no_new_entries_same_strategy: true
+    enter_tight_trailing: true
+    restore_to_normal_trailing_if_back_to_a: false   # Q16
+
+  # ----- D1 處理 (Q2) -----
+  d1_action:
+    cancel_pending_orders: true
+    no_new_entries: true
+    use_emergency_tight_stop: true
+
+  # ----- D2 處理 (Q17) -----
+  d2_action:
+    websocket_disconnect:        { reduce_only_pct: 100 }
+    api_latency_abnormal:        { reduce_only_pct: 100 }
+    margin_data_unavailable:     { reduce_only_pct: 100 }
+    order_update_unavailable:    { reduce_only_pct: 100 }
+    kline_missing_1_to_2_bars:   { reduce_only_pct: 50  }
+    kline_missing_more_than_2:   { reduce_only_pct: 100 }
+    unknown_position_size:
+      action: "wait_until_confirmed"
+      allow_reverse_order: false
+    prefer_close_position_endpoint: true
+
+# -------------------------------------------------------------
+# 4. Realized Volatility (§3.5, Q5, Q13)
+# -------------------------------------------------------------
+realized_vol:
+  method: "atr_pct"
+  timeframe: "1h"
+  atr_period: 14
+
+  warmup:
+    day_1_to_30:
+      trade_allowed: false
+      metrics_counted: false
+    day_31_to_90:
+      trade_allowed: true
+      method: "fixed_threshold"
+      atr_pct_extreme_threshold: 0.04
+    day_91_plus:
+      trade_allowed: true
+      method: "rolling_percentile"
+      lookback_days: 90
+      threshold_percentile: 95
+
+# -------------------------------------------------------------
+# 5. 主策略 1 — 趨勢回踩 (§4)
+# -------------------------------------------------------------
+trend_pullback:
+  enabled: true
+
+  # ----- 進場條件 (Q21, Q22) -----
+  entry:
+    ema_pullback_atr_mult: 0.3            # Q21: low ≤ EMA + 0.3*ATR
+    ema_band_atr_mult: 0.3                # Q21: close 在 EMA ± 0.3*ATR
+    ema_short_period: 20
+    ema_long_period: 50
+    rsi_period: 14
+    rsi_lookback_bars: 5                  # Q22: 過去 5 根 1H
+    rsi_threshold: 50                     # Q22
+    funding_z_long_max: 2.0
+    funding_z_short_min: -2.0
+
+  # ----- 1H 訊號有效窗口 (Q23) -----
+  signal_validity_window_5m_bars: 12      # Q23
+
+  # ----- 5M 確認 (Q11) -----
+  confirmation_5m:
+    rule: "two_of_three"
+    breakout_lookback: 3                  # 突破前 3 根 high/low
+    ema9_period: 9
+    ema9_slope_lookback_bars: 2           # Q20: EMA9[i] > EMA9[i-2]
+    strong_close:
+      close_position_min: 0.7
+      body_ratio_min: 0.5
+    engulfing:
+      body_growth_min: 1.1
+
+  # ----- 進場掛單 (Q12, Q26, Q27) -----
+  entry_order:
+    mode: "limit_maker_pullback"
+    timeout_5m_bars: 2                    # Q12
+    chase_allowed: false                  # Q12
+    quantity_basis: "limit_price"         # Q26
+    partial_fill:
+      treat_filled_as_entry: true         # Q27
+      cancel_remaining_after_timeout: true # Q27
+    taker_fallback:
+      allowed: true
+      conditions_all_required:
+        - "signal_still_valid"
+        - "spread_normal_ratio_max: 1.5"
+        - "estimated_slippage_bps_max: 2"
+        - "adx_4h_min: 28"
+
+  # ----- Pivot Stop Loss (Q9) -----
+  stop_loss:
+    method: "confirmed_pivot"
+    pivot_timeframe: "1h"
+    pivot_n: 5
+    pivot_confirm_delay_bars: 5
+    pivot_buffer_atr_mult: 0.2
+    fallback_atr_mult: 1.8
+
+  # ----- Take Profit -----
+  take_profit:
+    tp1:
+      r_multiple: 1.0
+      exit_pct: 50
+      move_sl_to: "breakeven"
+    tp2:
+      r_multiple_min: 2.5
+      r_multiple_max: 3.0
+    trailing_after_2r:
+      method: "max_of_ema20_1h_and_peak_minus_atr"
+      atr_mult: 1.5
+
+  # ----- 同策略 Cooldown (Q29) -----
+  cooldown_after:
+    sl_exit_1h_bars: 1                    # Q29: SL → cooldown 1 根 1H
+    tp_exit_1h_bars: 0                    # Q29: TP → 不 cooldown
+
+# -------------------------------------------------------------
+# 6. 主策略 2 — 均值回歸 (§5)
+# -------------------------------------------------------------
+mean_reversion:
+  enabled: true
+
+  # ----- 指標 (Q19) -----
+  bollinger:
+    timeframe: "1h"
+    period: 20
+    std_multiplier: 2.0
+    source: "close"
+
+  vwap:
+    reset: "daily"
+    reset_time_utc: "00:00"
+
+  vwap_deviation:
+    lookback_hours: 24
+    multiplier: 1.5
+
+  # ----- 進場條件 -----
+  entry:
+    rsi_period: 14
+    rsi_long_max: 28
+    rsi_short_min: 72
+    funding_z_abs_max: 1.5                # Funding 中性
+
+  # ----- 5M 止跌/止漲確認 (Q25) -----
+  confirmation_5m:
+    rule: "two_of_three"
+    long_signals:
+      - "close_in_upper_60_pct_of_range"
+      - "bullish_engulfing_or_hammer"
+      - "rsi_oversold_uptick"
+    short_signals:
+      - "close_in_lower_60_pct_of_range"
+      - "bearish_engulfing_or_shooting_star"
+      - "rsi_overbought_downtick"
+    close_position_in_range_min: 0.6
+    rsi_oversold: 30
+    rsi_overbought: 70
+
+  # ----- 出場 -----
+  exit:
+    tp_target: ["bollinger_middle", "vwap"]    # 任一觸及
+    sl_atr_mult_min: 0.8
+    sl_atr_mult_max: 1.2
+    time_stop_hours: 12
+
+  cooldown_after:
+    sl_exit_1h_bars: 1
+    tp_exit_1h_bars: 0
+
+# -------------------------------------------------------------
+# 7. 副策略 — Funding / Premium 反轉 (§6)
+# -------------------------------------------------------------
+funding_reversal:
+  enabled: true                           # 副策略，啟用但 risk cap 較緊
+
+  entry:
+    funding_z_threshold: 2.5
+    premium_z_threshold: 2.0
+    mark_index_divergence_min_bps: 15     # 0.0015
+    rsi_overbought: 75
+    rsi_oversold: 25
+    no_new_high_low_lookback_bars: 5      # Tier 3.3
+
+  conflict_with_opposite_position:        # Q18
+    action: "wait"
+    reduce_existing: false
+    open_reverse: false
+
+  exit:
+    tp_target: ["mark_price", "vwap"]
+    sl_atr_mult_min: 0.8
+    sl_atr_mult_max: 1.5
+    time_stop_hours: 12
+
+# -------------------------------------------------------------
+# 8. Trailing Modes (§7)
+# -------------------------------------------------------------
+trailing:
+  # ----- 標準模式 -----
+  standard:
+    move_to_breakeven_at_r: 1.0
+    activate_trailing_at_r: 2.0
+
+  # ----- Tight Trailing (Q1, Q14, Q16) -----
+  tight_trailing:
+    pivot_timeframe: "5m"
+    pivot_n: 3
+    pivot_confirm_delay_bars: 3
+    pivot_buffer_atr_mult: 0.1
+    only_tighten: true                    # 只能收緊
+    floor_breakeven_at_r: 1.0
+    lock_05r_at_r: 1.5
+    once_enabled_lock_until_close: true   # Q16
+
+  # ----- Emergency Tight Stop (D1) -----
+  emergency_tight:
+    breakeven_at_r: 0.5
+    lock_03r_to_05r_at_r: 1.0
+    early_exit_on_5m_structure_break: true
+
+  # ----- Trigger 機制 (Tier 3.4) -----
+  trigger:
+    method: "intrabar_hit"
+    live_order_type: "STOP_MARKET"
+    reduce_only: true
+
+# -------------------------------------------------------------
+# 9. 風險管理 (§8)
+# -------------------------------------------------------------
+risk:
+  active_profile: "phase1_conservative"
+
+  profiles:
+    phase1_conservative:
+      risk_per_trade_pct: 0.75
+      max_total_open_risk_pct: 1.5
+      daily_loss_limit_pct: -2.0
+      weekly_loss_limit_pct: -6.0
+      target_daily_usdt_min: 50
+      target_daily_usdt_max: 90
+    phase2_mature:
+      risk_per_trade_pct: 1.0
+      max_total_open_risk_pct: 2.0
+      daily_loss_limit_pct: -2.5
+      target_daily_usdt_min: 70
+      target_daily_usdt_max: 120
+    phase3_aggressive:
+      risk_per_trade_pct: 1.25
+      max_total_open_risk_pct: 2.5
+      daily_loss_limit_pct: -3.0
+      target_daily_usdt_min: 100
+      target_daily_usdt_max: 150
+
+  # ----- 連虧 (Q6, Q7) -----
+  loss_streak:
+    reduce_after_consecutive_losses: 2
+    risk_multiplier_when_reduced: 0.5
+    recover_min_r_multiple: 0.3
+    stop_trading_after_consecutive_losses: 4
+    reset_daily: true                     # daily_* 清零
+    reset_consecutive_daily: false        # consecutive 不清
+
+  # ----- Equity 基準 (Q28) -----
+  equity_basis:
+    formula: "wallet_balance + realized_pnl - max(0, -unrealized_pnl)"
+    description: "正浮盈不算入；負浮虧即時扣"
+
+  # ----- BTC + ETH Correlation (Q8) -----
+  correlation_haircut:
+    enabled: true
+    pairs:
+      - ["BTC/USDT:USDT", "ETH/USDT:USDT"]
+    same_direction_combined_max_pct: 1.0
+    allocation:
+      btc_first:        { btc_pct: 0.7, eth_pct: 0.3 }
+      eth_first:        { btc_pct: 0.5, eth_pct: 0.5 }
+      same_bar:         { btc_pct: 0.6, eth_pct: 0.4 }
+
+  # ----- Per-strategy cap (§8.7) -----
+  per_strategy_cap_pct:
+    trend: 1.5
+    mean_reversion: 1.0
+    funding_reversal: 0.75
+
+  priority:
+    - "existing_position_risk_management"
+    - "trend_pullback"
+    - "mean_reversion"
+    - "funding_reversal"
+
+  # ----- 反向倉位 (Q24) -----
+  opposite_position_per_symbol:
+    allow_open_opposite: false            # Q24
+    use_hedge_mode: false
+    force_close_existing: false
+    wait_until_existing_closed: true
+
+# -------------------------------------------------------------
+# 10. Funding (§9)
+# -------------------------------------------------------------
+funding:
+  lookback_days: 90
+  default_interval_hours: 8
+  expected_samples: 270
+  min_samples_required: 120
+
+  z_score_source: "funding_rate"          # Q4
+  pnl_source: "funding_amount"            # Q4
+
+  settlement_times_utc: ["00:00", "08:00", "16:00"]
+  pnl_counts_into_daily_loss_limit: true  # Tier 3.2
+
+  insufficient_samples_action:
+    disable_funding_reversal: true
+    funding_filter_weight: "light"
+
+# -------------------------------------------------------------
+# 11. Pivot Detection (§4.6, §7.2)
+# -------------------------------------------------------------
+pivot:
+  normal:
+    timeframe: "1h"
+    n: 5
+    confirm_delay_bars: 5
+    buffer_atr_mult: 0.2
+  tight_trailing:
+    timeframe: "5m"
+    n: 3
+    confirm_delay_bars: 3
+    buffer_atr_mult: 0.1
+
+# -------------------------------------------------------------
+# 12. 驗證體系 (§10)
+# -------------------------------------------------------------
+validation:
+  samples:
+    is_research:        ["2021-01-01", "2023-12-31"]
+    rolling_validation: ["2024-01-01", "2025-03-31"]
+    final_oos:          ["2025-04-01", "2026-03-31"]
+
+  l0_pure_backtest:
+    sharpe_min: 1.2
+    calmar_min: 1.0
+    mdd_max_pct: 20
+    profit_factor_min: 1.15
+    trades_min: 250
+    avg_trade_to_round_trip_cost_min: 1.5
+
+  l1_walk_forward:
+    train_days: 360
+    test_days: 90
+    step_days: 30
+    aggregated_oos_sharpe_min: 0.8
+    oos_to_is_cagr_ratio_min: 0.6
+
+  l2_mcpt:
+    paths_min: 5000
+    perturbations:
+      price_arma_garch_residual_resample: true
+      trade_latency_bars_max: 1
+      additional_slippage_bps_max: 3
+      missing_fill_rate_pct: 5
+      fee_shock: true
+    pct5_cagr_min: 0
+    loss_30d_prob_max_pct: 35
+    risk_of_ruin_max: 0.001
+
+  l3_block_bootstrap:
+    method: "stationary_bootstrap"
+    block_length_bars_min: 24
+    block_length_bars_max: 72
+    expectancy_lower_ci_min: 0
+    pct95_mdd_max_pct: 22
+
+  l4_multiple_testing:
+    bonferroni_alpha: 0.05
+    pbo_via_cscv_max: 0.20
+    dsr_min: 0.95
+
+  l5_final_oos:
+    sharpe_min: 0.7
+    calmar_min: 0.8
+    profit_factor_min: 1.08
+
+  l6_regime_stratification:
+    dimensions:
+      - "trend_strength"
+      - "realized_vol_regime"
+      - "funding_extreme_neutral"
+      - "bull_bear"
+    main_regime_expectancy_min: 0
+    min_positive_regimes_required: 2
+
+  on_failure:
+    allow_silent_param_tuning: false      # 工程紀律 #5
+    require_failure_report: true
+
+# -------------------------------------------------------------
+# 13. 部署階段 (§11)
+# -------------------------------------------------------------
+deployment:
+  stages:
+    - name: "research"
+      requires: ["l0", "l1", "l2", "l3", "l4", "l5", "l6"]
+    - name: "shadow"
+      duration_days_min: 7
+      live_feed: true
+      orders: false
+    - name: "dry_run"
+      duration_days_min: 30
+      simulated_orders: true
+    - name: "canary"
+      duration_days_min: 30
+      capital_usdt_max: 1000              # 待 BOSS 拍板
+    - name: "scale_up"
+      gradual: true
+
+  cross_stage_promotion:
+    require_all_metrics_pass: true
+    no_skipping: true
+
+# -------------------------------------------------------------
+# 14. 工程紀律
+# -------------------------------------------------------------
+engineering_discipline:
+  spec_lock_file: "docs/R3_spec.md"
+  spec_version: "1.0"
+  no_hardcoded_magic_numbers: true
+  unit_tests_required_for: ["Q21", "Q22", "Q23", "Q24", "Q25", "Q26", "Q27", "Q28", "Q29"]
+  full_validation_pipeline_before_live: "tools/validate_all.py"
+  fail_handling: "report_only_no_silent_tuning"
