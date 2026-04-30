@@ -61,3 +61,5 @@ execution:
   check_interval_seconds: 30
   use_market_orders: true
   slippage_tolerance_pct: 0.1
+  order_cooldown_sec: 60         # 同 symbol 下單冷卻秒數（防重複送單）
+  order_reconcile_sec: 10        # 下單後 reconcile 實際成交的等待上限

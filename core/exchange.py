@@ -23,6 +23,14 @@ class Exchange:
     MAX_RETRIES = 3
     RETRY_DELAYS = [1, 2, 4]  # 秒，指數退避
 
+    # 這些幣安錯誤碼代表「不可重試」—— 重試只會造成重複下單或無意義失敗
+    # -2027: Exceeded max allowable position at current leverage（已達倉位上限）
+    # -4131: PERCENT_PRICE filter（價格偏離過大）
+    # -2019: Margin is insufficient（保證金不足，已被另一 except 處理但補上）
+    # -2021: Order would immediately trigger（止損單觸發價設錯）
+    # -4045: Max open orders exceeded
+    NON_RETRYABLE_CODES = ("-2027", "-4131", "-2019", "-2021", "-4045")
+
     def __init__(self, settings: dict):
         self.settings = settings
         self.is_testnet = settings.get("mode", "testnet") == "testnet"
@@ -212,6 +220,11 @@ class Exchange:
                 raise
             except ccxt.ExchangeError as e:
                 last_error = e
+                err_str = str(e)
+                # 不可重試的錯誤：直接拋出，避免重複下單
+                if any(code in err_str for code in self.NON_RETRYABLE_CODES):
+                    logger.warning(f"[{label}] 不可重試錯誤，立即停止：{e}")
+                    raise
                 logger.warning(f"[{label}] 交易所錯誤（{attempt}/{self.MAX_RETRIES}）：{e}")
                 time.sleep(delay)
 

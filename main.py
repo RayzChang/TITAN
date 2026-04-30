@@ -30,6 +30,7 @@ from config.settings_loader import load_settings
 from core.exchange import Exchange
 from core.position_manager import PositionManager
 from core.risk_manager import RiskManager
+from core.state_store import StateStore
 from scanner.market_scanner import MarketScanner
 from strategies.range_breakout import RangeBreakout
 from utils.logger import get_logger
@@ -72,9 +73,25 @@ class TitanBot:
         self.scanner   = MarketScanner(self.exchange, settings)
         self.risk_mgr  = RiskManager(self.exchange, settings)
         self.pos_mgr   = PositionManager(self.exchange, settings)
+        self.state     = StateStore()
 
-        # 記錄初始餘額（複利基準 + 最終報告用）
-        self.initial_balance: float = self.exchange.get_total_balance()
+        # 下單冷卻秒數（防止同 symbol 短時間重複送單）
+        self.order_cooldown_sec: int = int(
+            settings.get('execution', {}).get('order_cooldown_sec', 60)
+        )
+        # 市價單 timeout 秒數（送單失敗後查成交的等待上限）
+        self.order_reconcile_sec: int = int(
+            settings.get('execution', {}).get('order_reconcile_sec', 10)
+        )
+
+        # B：快取上次成功取得的餘額（fallback 用，不用初始值）
+        try:
+            self._last_known_balance: float = self.exchange.get_total_balance()
+        except Exception:
+            self._last_known_balance: float = float(
+                settings['capital']['total_usdt']
+            )
+        self.initial_balance: float = self._last_known_balance
 
         # 排程器
         self.scheduler = BlockingScheduler(timezone='UTC')
@@ -82,6 +99,9 @@ class TitanBot:
 
         # 週期計數（用來控制狀態摘要顯示頻率）
         self._cycle_count: int = 0
+
+        # 孤兒倉位清單（啟動對帳後填入，這些 symbol 禁止自動開新單）
+        self._orphan_symbols: set = set()
 
         logger.info(f"[TITAN] 策略：{repr(self.strategy)}")
         logger.info(f"[TITAN] 初始餘額：${self.initial_balance:,.2f} USDT")
@@ -99,6 +119,9 @@ class TitanBot:
 
         # 預先設定所有幣種的槓桿與保證金模式
         self._setup_symbols()
+
+        # 啟動對帳：以交易所為真相，偵測孤兒倉位
+        self._reconcile_on_startup()
 
         # 初始化每個 symbol 的箱體（手動 or 自動）
         self._init_boxes()
@@ -188,15 +211,44 @@ class TitanBot:
             newly_closed = self.pos_mgr.sync_positions()
             for trade in newly_closed:
                 self.risk_mgr.record_trade(trade.pnl_usdt)
+                self.state.clear_position(trade.symbol)
+                self.strategy.on_position_closed(trade.symbol)
+                # R2：平倉後若箱體失效，立刻重建新箱體
+                self.strategy.rebuild_box_if_invalidated(trade.symbol)
         except Exception as e:
             logger.warning(f"[TITAN] 倉位同步失敗：{e}")
 
-        # ── Step 2：帳戶回撤保護 ──
+        # 運行中孤兒偵測：每輪都對比 active_trades vs 交易所（保險 ②+③）
+        try:
+            live_positions = self.exchange.get_all_positions()
+            live_syms = {p['symbol'] for p in live_positions}
+            active_syms = set(self.pos_mgr.get_active_symbols())
+
+            # 交易所有 + 本地沒 + 不在孤兒清單 → 新孤兒
+            new_orphans = live_syms - active_syms - self._orphan_symbols
+            for s in new_orphans:
+                pos = next(p for p in live_positions if p['symbol'] == s)
+                logger.warning(
+                    f"[對帳] 運行中發現新孤兒倉位 {s} "
+                    f"{pos.get('side')} {pos.get('contracts')} @ {pos.get('entryPrice')}，禁開新單"
+                )
+                self._orphan_symbols.add(s)
+
+            # 原有孤兒消失（手動平倉） → 解除禁令
+            cleared = {s for s in self._orphan_symbols if s not in live_syms}
+            for s in cleared:
+                logger.info(f"[對帳] {s} 孤兒倉位已消失（手動平倉），解除禁令")
+                self._orphan_symbols.discard(s)
+        except Exception as e:
+            logger.debug(f"[對帳] 運行中對帳失敗：{e}")
+
+        # ── Step 2：帳戶回撤保護 ──（B：快取上次成功值）
         try:
             current_balance = self.exchange.get_total_balance()
+            self._last_known_balance = current_balance
         except Exception as e:
-            logger.warning(f"[TITAN] 取得餘額失敗：{e}")
-            return
+            logger.warning(f"[TITAN] 取得餘額失敗，使用快取值：{e}")
+            current_balance = self._last_known_balance
 
         if self.risk_mgr.check_drawdown_stop(current_balance):
             logger.error("[TITAN] 帳戶回撤超過保護線，停止所有交易！")
@@ -262,17 +314,17 @@ class TitanBot:
                 f"ceilings=[{ceil_str}] | 現價={df['close'].iloc[-1]:.2f}"
             )
 
-        # 異常行情偵測（單根 K 線波動過大）
-        if self.risk_mgr.check_anomaly(df.iloc[-1]):
+        # 異常行情偵測（用已收完 1H K 棒）
+        if self.risk_mgr.check_anomaly(df.iloc[-2]):
             return False
 
-        # 更新箱體狀態（延伸上緣 / 失效偵測）
-        last_bar = df.iloc[-1]
+        # Fix 1：箱體狀態更新用「最近一根已收日線」（規格：箱體判斷用日線）
+        last_daily = df_1d.iloc[-2]   # iloc[-1] 是今日未收完日線
         self.strategy.update_box(
             symbol         = symbol,
-            current_high   = float(last_bar['high']),
-            current_close  = float(last_bar['close']),
-            current_volume = float(last_bar['volume']),
+            current_high   = float(last_daily['high']),
+            current_close  = float(last_daily['close']),
+            current_volume = float(last_daily['volume']),
         )
 
         # 計算訊號
@@ -281,6 +333,11 @@ class TitanBot:
         except Exception as e:
             logger.warning(f"[{symbol}] 策略計算失敗：{e}")
             return False
+
+        # Fix 4：計算訊號後，把 anti_repeat 狀態寫回 state.json（防重複追單持久化）
+        ar_state = self.strategy.get_anti_repeat_state(symbol)
+        if ar_state:
+            self.state.save_anti_repeat(symbol, ar_state)
 
         if trade_signal not in ('LONG', 'SHORT'):
             return False
@@ -293,21 +350,52 @@ class TitanBot:
             logger.info(f"[訊號] {symbol} 被風控攔截：{reason}")
             return False
 
-        # 執行開倉
-        return self._open_position(symbol, trade_signal)
+        # Fix 5：把 df 傳進去，不重複 fetch（get_triggered_ceiling 用）
+        return self._open_position(symbol, trade_signal, df_1h=df)
 
     # ── 開倉執行 ──────────────────────────────────────────────────────
 
-    def _open_position(self, symbol: str, trade_signal: str) -> bool:
+    def _open_position(self, symbol: str, trade_signal: str,
+                       df_1h=None) -> bool:
         """
-        執行開倉：
+        執行開倉（含全套防呆保護）：
 
-        1. 取當前市價
-        2. 計算倉位大小（複利模式：用最新餘額）
-        3. 用策略計算 SL/TP（支援未來 ATR 動態模式）
-        4. 送出市價主單 + SL 止損單 + TP 止盈單
-        5. 登記至 PositionManager
+        P0-1  下單前先檢查「交易所實際倉位」+「本地 state」，有倉即 skip
+        P2-1  下單冷卻期檢查（60 秒內同 symbol 不可重複送單）
+        P0-3  送單 exception 後 reconcile 實際成交狀態
+        P1-1  成功後寫入 state.json
         """
+        # ── P1-2：孤兒倉位禁開 ──
+        if symbol in self._orphan_symbols:
+            logger.warning(f"[開倉] {symbol} 為孤兒倉位（啟動時已存在、本地無紀錄），禁止開新單")
+            return False
+
+        # ── P0-1：下單前檢查 (交易所為真) ──
+        try:
+            live_pos = self.exchange.get_position(symbol)
+            if live_pos and float(live_pos.get('contracts', 0)) != 0:
+                logger.warning(
+                    f"[開倉] {symbol} 交易所已有倉位 "
+                    f"({live_pos.get('side')} {live_pos.get('contracts')})，跳過"
+                )
+                return False
+        except Exception as e:
+            logger.warning(f"[開倉] {symbol} 查倉位失敗：{e}，為安全起見跳過本次")
+            return False
+
+        # ── P0-1：本地 state 檢查 ──
+        if self.state.has_position(symbol):
+            logger.warning(f"[開倉] {symbol} 本地 state 有紀錄，跳過")
+            return False
+
+        # ── P2-1：下單冷卻期 ──
+        elapsed = self.state.seconds_since_last_order(symbol)
+        if elapsed is not None and elapsed < self.order_cooldown_sec:
+            logger.info(
+                f"[開倉] {symbol} 下單冷卻中（{elapsed:.0f}s / {self.order_cooldown_sec}s），跳過"
+            )
+            return False
+
         # 取當前市價
         try:
             ticker      = self.exchange.get_ticker(symbol)
@@ -323,8 +411,11 @@ class TitanBot:
                 if self.compound
                 else float(self.settings['capital']['total_usdt'])
             )
+            self._last_known_balance = balance
         except Exception:
-            balance = float(self.settings['capital']['total_usdt'])
+            # B：fallback 到上次成功快取值，不用初始值
+            balance = self._last_known_balance
+            logger.warning(f"[開倉] {symbol} 取餘額失敗，用快取值 {balance:.2f}")
 
         # 倉位數量計算（SHIELD 規則：floor 至 3 位小數）
         amount = self.risk_mgr.calculate_position_size(balance, entry_price)
@@ -358,16 +449,56 @@ class TitanBot:
             f"SL：{sl_price} | TP：{tp_price}"
         )
 
+        # ── P2-1：先蓋冷卻戳記（即使下單失敗也算，避免無限重試）──
+        self.state.mark_order_sent(symbol)
+
+        # ── 送市價主單 ──
+        main_order_ok = False
         try:
-            # ① 市價主單
             self.exchange.create_order(
                 symbol     = symbol,
                 order_type = 'market',
                 side       = side,
                 amount     = amount,
             )
+            main_order_ok = True
+        except Exception as e:
+            logger.error(f"[開倉] {symbol} 市價主單 exception：{e}")
 
-            # ② 止損單（STOP_MARKET）
+        # ── P0-3 + P1-3：reconcile 實際倉位（exception 不代表真的沒成交）──
+        time.sleep(1)  # 給交易所 1 秒處理時間
+        actual_pos = None
+        try:
+            actual_pos = self.exchange.get_position(symbol)
+        except Exception as e:
+            logger.error(f"[開倉] {symbol} reconcile 查倉失敗：{e}")
+
+        actual_contracts = float(actual_pos.get('contracts', 0)) if actual_pos else 0
+
+        if abs(actual_contracts) < 1e-6:  # E：浮點 epsilon
+            # 真的沒成交，主單失敗收工
+            if not main_order_ok:
+                logger.error(f"[開倉] {symbol} 送單失敗且無實際倉位，放棄")
+            return False
+
+        # 實際有成交！以交易所實際數量為準
+        if abs(actual_contracts - amount) > 1e-6:
+            logger.warning(
+                f"[開倉] {symbol} 實際成交數量 {actual_contracts} 與計劃 {amount} 不一致，"
+                f"以實際為準"
+            )
+            amount = actual_contracts
+
+        # 以交易所實際開倉價覆寫（若可得）
+        actual_entry = float(actual_pos.get('entryPrice') or entry_price)
+        entry_price = actual_entry
+
+        # 重新計算 SL/TP（基於實際成交價）
+        sl_price = self.strategy.get_stop_loss(entry_price, trade_signal, symbol)
+        tp_price = self.strategy.get_take_profit(entry_price, trade_signal, symbol)
+
+        # ── 掛 SL / TP 單（若失敗則緊急平倉，避免裸倉）──
+        try:
             self.exchange.create_order(
                 symbol     = symbol,
                 order_type = 'stop_market',
@@ -379,8 +510,6 @@ class TitanBot:
                     'closePosition': False,
                 },
             )
-
-            # ③ 止盈單（TAKE_PROFIT_MARKET）
             self.exchange.create_order(
                 symbol     = symbol,
                 order_type = 'take_profit_market',
@@ -392,14 +521,17 @@ class TitanBot:
                     'closePosition': False,
                 },
             )
-
         except Exception as e:
-            logger.error(f"[開倉] {symbol} 送單失敗：{e}")
-            # 若主單已成交但附屬單失敗，嘗試取消所有掛單（避免裸倉）
+            logger.error(f"[開倉] {symbol} SL/TP 掛單失敗：{e}，緊急市價平倉避免裸倉")
             try:
                 self.exchange.cancel_all_orders(symbol)
-            except Exception:
-                pass
+                self.exchange.create_order(
+                    symbol=symbol, order_type='market',
+                    side=close_side, amount=amount,
+                    params={'reduceOnly': True},
+                )
+            except Exception as e2:
+                logger.error(f"[開倉] {symbol} 緊急平倉也失敗！請立刻手動處理：{e2}")
             return False
 
         # 登記至倉位管理器（優先使用固定金額設定）
@@ -417,16 +549,39 @@ class TitanBot:
             position_usdt = position_usdt,
         )
 
-        logger.info(f"[開倉成功] {symbol} 開{direction} | 保證金：${position_usdt:.2f}")
+        # ── P1-1：寫入 state.json ──
+        self.state.record_position(
+            symbol=symbol, side=trade_signal,
+            entry_price=entry_price, amount=amount,
+            sl_price=sl_price, tp_price=tp_price,
+        )
+
+        # R1/R3：登記持倉狀態（base_ceiling、凍結空單SL）
+        # Fix 5：用傳入的 df_1h，不重複 fetch
+        base_ceiling = (
+            self.strategy.get_triggered_ceiling(df_1h, symbol)
+            if trade_signal == 'LONG' and df_1h is not None
+            else None
+        )
+        self.strategy.on_position_opened(symbol, trade_signal, base_ceiling)
+        self.state.save_pos_state(symbol, self.strategy.get_pos_state(symbol))
+        # Fix 4：anti_repeat 持久化
+        self.state.save_anti_repeat(symbol, self.strategy.get_anti_repeat_state(symbol))
+
+        logger.info(
+            f"[開倉成功] {symbol} 開{direction} | "
+            f"實際進場：{entry_price} | 數量：{amount} | 保證金：${position_usdt:.2f}"
+        )
         return True
 
-    # ── 持倉管理（TP1 / 減倉 / 加倉）────────────────────────────────
+    # ── 持倉管理（TP1 / TP2 / 加倉）────────────────────────────────
     def _manage_open_positions(self):
         """
         對所有現有持倉執行管理動作：
-        - TP1  : 4H MACD 反向交叉 → 取消現有 TP，平掉一半，止損移至開倉價
-        - reduce: 日線 MACD 反向  → 減半倉（警示）
-        - addon : 4H 連續確認     → 加倉同方向 100U
+        - tp1_and_tp2: TP1+TP2 同時觸發 → 直接全平（R4）
+        - tp1        : 4H MACD 反向 → 平倉一半 + SL 移至 BE
+        - tp2        : TP1 後 1H MACD 反向 → 全平
+        - addon      : TP1 前 4H 確認 + 日線 MACD → 加倉（Q2/Q3 更新 SL/TP）
         """
         active_positions = self.pos_mgr.get_active_positions()
         if not active_positions:
@@ -437,87 +592,135 @@ class TitanBot:
             if not signal:
                 continue
 
-            # 注入最新多時間週期資料（讓策略計算最新 MACD 狀態）
             try:
+                df_1h = self.exchange.get_ohlcv(symbol, '1h', limit=KLINE_1H)
                 df_4h = self.exchange.get_ohlcv(symbol, '4h', limit=KLINE_4H)
                 df_1d = self.exchange.get_ohlcv(symbol, '1d', limit=KLINE_1D)
                 self.strategy.update_data(df_4h, df_1d)
+                self.strategy.update_1h_data(df_1h)
             except Exception as e:
                 logger.debug(f"[{symbol}] 持倉管理取 K 線失敗：{e}")
                 continue
 
-            action = self.strategy.get_management_action(symbol, signal)
+            action     = self.strategy.get_management_action(symbol, signal)
+            entry_price = pos.get('entry_price', 0)
+            amount      = pos.get('amount', 0)
+            sl_price    = pos.get('sl_price', 0)
+            tp_price    = pos.get('tp_price', 0)
+            close_side  = 'sell' if signal == 'LONG' else 'buy'
 
-            # ── TP1：止盈一半 + 止損移至開倉價 ──────────────────────
-            if action.get('tp1'):
-                logger.info(f"[管理] {symbol} TP1 觸發（4H MACD 反向）→ 平倉一半，止損移至開倉價")
+            # ── R4：TP1+TP2 同時觸發 → 直接全平 ─────────────────────
+            if action.get('tp1_and_tp2'):
+                logger.info(f"[管理] {symbol} TP1+TP2 同時觸發 → 直接全平")
                 try:
-                    entry_price = pos.get('entry_price', 0)
-                    amount      = pos.get('amount', 0)
-                    half_amount = amount / 2
-                    close_side  = 'sell' if signal == 'LONG' else 'buy'
-
-                    # 平倉一半
+                    self.exchange.cancel_all_orders(symbol)
                     self.exchange.create_order(
-                        symbol     = symbol,
-                        order_type = 'market',
-                        side       = close_side,
-                        amount     = half_amount,
-                        params     = {'reduceOnly': True},
+                        symbol=symbol, order_type='market',
+                        side=close_side, amount=amount,
+                        params={'reduceOnly': True},
                     )
-                    logger.info(f"[管理] {symbol} TP1 平倉一半成功 ({half_amount})")
+                    self.state.clear_position(symbol)
+                    self.strategy.on_position_closed(symbol)
+                    logger.info(f"[管理] {symbol} 全平完成")
+                except Exception as e:
+                    logger.warning(f"[管理] {symbol} 全平失敗：{e}")
+                continue
 
-                    # 取消舊止損單，補新止損（移至開倉價）
+            # ── TP1：平倉一半 + SL 移至 BE ───────────────────────────
+            if action.get('tp1'):
+                logger.info(f"[管理] {symbol} TP1（4H MACD 反向）→ 平一半，SL 移 BE")
+                try:
+                    half_amount = math.floor(amount / 2 * 1000) / 1000
+                    self.exchange.create_order(
+                        symbol=symbol, order_type='market',
+                        side=close_side, amount=half_amount,
+                        params={'reduceOnly': True},
+                    )
                     try:
                         self.exchange.cancel_all_orders(symbol)
                     except Exception:
                         pass
-
-                    new_sl = self.strategy.get_stop_loss(entry_price, signal)
-                    # 移至開倉價（保本止損）
-                    breakeven_sl = entry_price
                     self.exchange.create_order(
-                        symbol     = symbol,
-                        order_type = 'stop_market',
-                        side       = close_side,
-                        amount     = half_amount,
-                        params     = {
-                            'stopPrice':     breakeven_sl,
-                            'reduceOnly':    True,
-                            'closePosition': False,
-                        },
+                        symbol=symbol, order_type='stop_market',
+                        side=close_side, amount=half_amount,
+                        params={'stopPrice': entry_price, 'reduceOnly': True,
+                                'closePosition': False},
                     )
-                    logger.info(f"[管理] {symbol} 止損移至開倉價 {breakeven_sl:.2f}")
+                    logger.info(f"[管理] {symbol} TP1 完成，SL→{entry_price:.2f}")
+                    self.state.save_pos_state(
+                        symbol, self.strategy.get_pos_state(symbol)
+                    )
                 except Exception as e:
-                    logger.warning(f"[管理] {symbol} TP1 執行失敗：{e}")
+                    logger.warning(f"[管理] {symbol} TP1 失敗：{e}")
 
-            # ── reduce：日線 MACD 反向，提示減倉 ─────────────────────
-            if action.get('reduce'):
-                logger.info(f"[管理] {symbol} 日線 MACD 反向！建議減半倉（人工確認）")
-
-            # ── addon：加倉 ───────────────────────────────────────────
-            if action.get('addon'):
-                logger.info(f"[管理] {symbol} 加倉條件觸發（4H 連續 {self.strategy.addon_candles} 根確認）")
+            # ── TP2：全平剩餘 ─────────────────────────────────────────
+            if action.get('tp2'):
+                logger.info(f"[管理] {symbol} TP2（1H MACD 反向）→ 全平剩餘")
                 try:
-                    ticker      = self.exchange.get_ticker(symbol)
-                    entry_price = float(ticker['last'])
-                    balance     = (
-                        self.exchange.get_total_balance()
-                        if self.compound
-                        else float(self.settings['capital']['total_usdt'])
-                    )
-                    amount = self.risk_mgr.calculate_position_size(balance, entry_price)
-                    side   = 'buy' if signal == 'LONG' else 'sell'
+                    live = self.exchange.get_position(symbol)
+                    remain = float(live.get('contracts', 0)) if live else amount / 2
+                    if abs(remain) > 1e-6:
+                        self.exchange.cancel_all_orders(symbol)
+                        self.exchange.create_order(
+                            symbol=symbol, order_type='market',
+                            side=close_side, amount=remain,
+                            params={'reduceOnly': True},
+                        )
+                    self.state.clear_position(symbol)
+                    self.strategy.on_position_closed(symbol)
+                    logger.info(f"[管理] {symbol} TP2 全平完成")
+                except Exception as e:
+                    logger.warning(f"[管理] {symbol} TP2 失敗：{e}")
+                continue
+
+            # ── addon：加倉（Q2/Q3：加倉後更新 SL/TP）───────────────
+            if action.get('addon'):
+                logger.info(f"[管理] {symbol} 加倉條件觸發")
+                try:
+                    ticker       = self.exchange.get_ticker(symbol)
+                    addon_price  = float(ticker['last'])
+                    try:
+                        b = self.exchange.get_total_balance()
+                        self._last_known_balance = b
+                    except Exception:
+                        b = self._last_known_balance
+                    addon_amount = self.risk_mgr.calculate_position_size(b, addon_price)
+                    side         = 'buy' if signal == 'LONG' else 'sell'
 
                     self.exchange.create_order(
-                        symbol     = symbol,
-                        order_type = 'market',
-                        side       = side,
-                        amount     = amount,
+                        symbol=symbol, order_type='market',
+                        side=side, amount=addon_amount,
                     )
-                    logger.info(f"[管理] {symbol} 加倉成功 {amount} @ {entry_price:.2f}")
+                    new_total = amount + addon_amount
+                    try:
+                        self.exchange.cancel_all_orders(symbol)
+                        if sl_price:
+                            self.exchange.create_order(
+                                symbol=symbol, order_type='stop_market',
+                                side=close_side, amount=new_total,
+                                params={'stopPrice': sl_price, 'reduceOnly': True,
+                                        'closePosition': False},
+                            )
+                        if tp_price:
+                            self.exchange.create_order(
+                                symbol=symbol, order_type='take_profit_market',
+                                side=close_side, amount=new_total,
+                                params={'stopPrice': tp_price, 'reduceOnly': True,
+                                        'closePosition': False},
+                            )
+                    except Exception as e:
+                        logger.warning(f"[管理] {symbol} 加倉後更新 SL/TP 失敗：{e}")
+
+                    self.pos_mgr.update_trade_amount(symbol, new_total, sl_price, tp_price)
+                    self.state.update_position_amount(symbol, new_total, sl_price, tp_price)
+                    self.state.save_pos_state(symbol, self.strategy.get_pos_state(symbol))
+                    logger.info(f"[管理] {symbol} 加倉成功 {addon_amount} @ {addon_price:.2f}，總量 {new_total}")
                 except Exception as e:
                     logger.warning(f"[管理] {symbol} 加倉失敗：{e}")
+
+            # ── reduce（僅提示）──────────────────────────────────────
+            if action.get('reduce'):
+                logger.info(f"[管理] {symbol} 日線 MACD 反向！建議減倉（人工確認）")
 
     # ── 每日報告 + 重置 ────────────────────────────────────────────────
 
@@ -629,6 +832,80 @@ class TitanBot:
         )
 
     # ── 初始化輔助 ────────────────────────────────────────────────────
+
+    def _reconcile_on_startup(self):
+        """
+        啟動對帳（P1-2）：以交易所為最終真相。
+
+        狀況處理：
+          - 交易所有倉 + state 有紀錄    → 同步（以交易所數量為準）
+          - 交易所有倉 + state 無紀錄    → 標記孤兒倉位，禁開新單
+          - 交易所無倉 + state 有紀錄    → 清除過期 state
+          - 都無                         → 正常空倉
+        """
+        logger.info("[TITAN] 啟動對帳：以交易所為真相...")
+        try:
+            live_positions = self.exchange.get_all_positions()
+        except Exception as e:
+            logger.error(f"[TITAN] 無法取得交易所持倉，對帳失敗：{e}")
+            return
+
+        live_by_symbol = {p['symbol']: p for p in live_positions}
+        state_positions = self.state.all_positions()
+
+        self._orphan_symbols: set = set()
+
+        # 1. 交易所有倉：對帳並恢復 pos_mgr（Q5）
+        for sym, pos in live_by_symbol.items():
+            contracts = float(pos.get('contracts', 0))
+            exchange_side = pos.get('side', '').upper()
+            entry = float(pos.get('entryPrice') or 0)
+
+            if sym in state_positions:
+                sp = state_positions[sym]
+                # 以交易所數量為準
+                sl  = sp.get('sl_price', 0)
+                tp  = sp.get('tp_price', 0)
+                sid = sp.get('side', exchange_side)
+                pos_usdt = sp.get('position_usdt',
+                    self.settings['capital'].get('position_fixed_usdt', 100))
+                self.pos_mgr.restore_trade(
+                    symbol=sym, side=sid,
+                    entry_price=sp.get('entry_price', entry),
+                    sl_price=sl, tp_price=tp,
+                    amount=contracts, position_usdt=pos_usdt,
+                )
+                # 恢復策略 pos_state（Q4）
+                saved_ps = self.state.get_pos_state(sym)
+                if saved_ps:
+                    self.strategy.restore_pos_state(sym, saved_ps)
+                # Fix 4：恢復 anti_repeat
+                saved_ar = self.state.get_anti_repeat(sym)
+                if saved_ar:
+                    self.strategy.restore_anti_repeat(sym, saved_ar)
+                logger.info(
+                    f"[對帳] {sym} 恢復持倉 {sid} {contracts} @ {entry} | "
+                    f"tp1_done={saved_ps.get('tp1_done') if saved_ps else '?'}"
+                )
+            else:
+                logger.warning(
+                    f"[對帳] {sym} 交易所有倉但本地無紀錄 → 孤兒倉位 "
+                    f"{exchange_side} {contracts} @ {entry}，禁止開新單"
+                )
+                self._orphan_symbols.add(sym)
+
+        # 2. state 有紀錄但交易所無倉：清除過期
+        for sym in list(state_positions.keys()):
+            if sym not in live_by_symbol:
+                logger.info(f"[對帳] {sym} state 有紀錄但交易所無倉，清除過期 state")
+                self.state.clear_position(sym)
+
+        # 恢復 anti_repeat（無論有無持倉，防重複追單狀態跨重啟保留）
+        for sym, ar in self.state.all_anti_repeat().items():
+            self.strategy.restore_anti_repeat(sym, ar)
+
+        if not live_by_symbol and not state_positions:
+            logger.info("[對帳] 無任何持倉，正常啟動")
 
     def _init_boxes(self):
         """啟動時為每個 symbol 初始化箱體（手動 or 自動偵測）"""

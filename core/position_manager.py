@@ -124,6 +124,10 @@ class PositionManager:
         self.leverage: int         = settings['risk']['leverage']
         self.active_trades: dict[str, TradeRecord] = {}
         self.closed_trades: list[TradeRecord]       = []
+        # 防誤判平倉：連續 missing 次數計數（2 次才算真平倉）
+        self._missing_count: dict[str, int] = {}
+        # 剛開倉 60 秒保護期（避免 Demo API 剛成交還沒 index 到就被誤判）
+        self.GRACE_PERIOD_SEC: int = 60
 
     # ── 開倉登記 ──────────────────────────────────────────────────────
 
@@ -156,54 +160,120 @@ class PositionManager:
         )
         return trade
 
+    def restore_trade(
+        self,
+        symbol:        str,
+        side:          str,
+        entry_price:   float,
+        sl_price:      float,
+        tp_price:      float,
+        amount:        float,
+        position_usdt: float,
+    ) -> TradeRecord:
+        """Q5：啟動對帳時，從 state.json 恢復 active_trade（不重複 log）"""
+        trade = TradeRecord(
+            symbol        = symbol,
+            side          = side,
+            entry_price   = entry_price,
+            sl_price      = sl_price,
+            tp_price      = tp_price,
+            amount        = amount,
+            position_usdt = position_usdt,
+            entry_time    = datetime.now(),
+        )
+        self.active_trades[symbol] = trade
+        return trade
+
+    def update_trade_amount(self, symbol: str, new_amount: float,
+                            new_sl: float, new_tp: float):
+        """Q2+Q3：加倉後更新 active_trade 的數量與 SL/TP"""
+        trade = self.active_trades.get(symbol)
+        if trade:
+            trade.amount   = new_amount
+            trade.sl_price = new_sl
+            trade.tp_price = new_tp
+
     # ── 同步偵測（核心）──────────────────────────────────────────────
 
     def sync_positions(self) -> list[TradeRecord]:
         """
         與交易所同步，偵測已被 SL/TP 觸發而平倉的倉位。
 
-        邏輯：
-          - 向交易所查詢所有有效倉位（contracts != 0）
-          - 若 active_trades 中的 symbol 不在交易所回傳的列表裡 → 已平倉
-          - 透過 _infer_exit() 推斷出場價與原因
-          - 移至 closed_trades，回傳本次新增的平倉列表
-
-        回傳 list[TradeRecord]（本次新偵測到的平倉）
+        三層保險：
+          ① 剛開倉 60 秒保護期 → 絕不判定平倉
+          ② 消失時先單獨查一次（雙重確認）
+          ③ 連續 2 次確認消失 → 才當真平倉
         """
         if not self.active_trades:
             return []
 
         try:
             live_positions = self.exchange.get_all_positions()
-            # ccxt 回傳的 symbol 格式為 'BTC/USDT:USDT'
             live_symbols = {p['symbol'] for p in live_positions}
         except Exception as e:
             logger.warning(f"[倉位] sync_positions 失敗，跳過本次偵測：{e}")
             return []
 
         newly_closed: list[TradeRecord] = []
+        now = datetime.now()
 
         for symbol, trade in list(self.active_trades.items()):
-            if symbol not in live_symbols:
-                # 倉位已消失 → SL 或 TP 已被觸發
-                exit_price, exit_reason = self._infer_exit(trade)
-                trade.close(
-                    exit_price  = exit_price,
-                    exit_time   = datetime.now(),
-                    exit_reason = exit_reason,
-                    leverage    = self.leverage,
-                )
-                self.closed_trades.append(trade)
-                del self.active_trades[symbol]
-                newly_closed.append(trade)
+            if symbol in live_symbols:
+                # 倉位存在 → 重置計數
+                self._missing_count.pop(symbol, None)
+                continue
 
-                sign = '+' if trade.pnl_usdt >= 0 else ''
-                logger.info(
-                    f"[倉位] 偵測平倉 {symbol} {trade.side} | "
-                    f"原因：{exit_reason} | "
-                    f"推算出場：{exit_price} | "
-                    f"損益：{sign}{trade.pnl_usdt:.2f} USDT ({sign}{trade.pnl_pct:.2f}%)"
+            # ── 保險 ①：剛開倉 60 秒保護期 ──
+            elapsed = (now - trade.entry_time).total_seconds()
+            if elapsed < self.GRACE_PERIOD_SEC:
+                logger.warning(
+                    f"[倉位] {symbol} 從列表消失但仍在保護期內 "
+                    f"({elapsed:.0f}s/{self.GRACE_PERIOD_SEC}s)，忽略"
                 )
+                continue
+
+            # ── 保險 ②：雙重確認（單獨查一次）──
+            try:
+                pos_direct = self.exchange.get_position(symbol)
+                if pos_direct and float(pos_direct.get('contracts', 0)) != 0:
+                    logger.warning(
+                        f"[倉位] {symbol} bulk 查不到但直查存在 → API 不穩，忽略"
+                    )
+                    self._missing_count.pop(symbol, None)
+                    continue
+            except Exception as e:
+                logger.warning(f"[倉位] {symbol} 直查失敗，保守忽略本次：{e}")
+                continue
+
+            # ── 保險 ③：連續 2 次消失才算真平倉 ──
+            self._missing_count[symbol] = self._missing_count.get(symbol, 0) + 1
+            if self._missing_count[symbol] < 2:
+                logger.warning(
+                    f"[倉位] {symbol} 第 {self._missing_count[symbol]} 次消失，"
+                    f"等下輪確認後再判定"
+                )
+                continue
+
+            # 三層都通過 → 真平倉
+            exit_price, exit_reason = self._infer_exit(trade)
+            trade.close(
+                exit_price  = exit_price,
+                exit_time   = now,
+                exit_reason = exit_reason,
+                leverage    = self.leverage,
+            )
+            self.closed_trades.append(trade)
+            del self.active_trades[symbol]
+            self._missing_count.pop(symbol, None)
+            newly_closed.append(trade)
+
+            sign = '+' if trade.pnl_usdt >= 0 else ''
+            logger.info(
+                f"[倉位] 偵測平倉 {symbol} {trade.side} | "
+                f"原因：{exit_reason} | "
+                f"推算出場：{exit_price} | "
+                f"損益：{sign}{trade.pnl_usdt:.2f} USDT ({sign}{trade.pnl_pct:.2f}%)"
+            )
 
         return newly_closed
 
@@ -328,29 +398,44 @@ class PositionManager:
 
     def _infer_exit(self, trade: TradeRecord) -> tuple:
         """
-        推斷平倉出場價與原因。
+        C：推斷平倉出場價與原因。
 
-        方法：
-          - 查詢當前市價
-          - 計算市價與 SL/TP 各自的距離
-          - 距離較近者為觸發原因，使用對應的 SL/TP 價格作為出場價
-
-        若查詢失敗，保守地假設為 SL 觸發。
+        優先查詢交易所歷史成交：找最近已成交的 STOP_MARKET 或 TAKE_PROFIT_MARKET。
+        失敗時 fallback 到距離啟發式（保守假設 SL）。
         """
+        try:
+            # 嘗試查最近 10 筆已成交訂單
+            orders = self.exchange.exchange.fetch_orders(
+                trade.symbol, limit=10,
+                params={"ordStatus": "filled"}
+            )
+            # 找最近 reduceOnly 已成交的出場單
+            close_side = 'sell' if trade.side == 'LONG' else 'buy'
+            for o in reversed(orders):
+                if (o.get('status') == 'closed'
+                        and o.get('side') == close_side
+                        and o.get('reduceOnly')):
+                    fill_price  = float(o.get('average') or o.get('price') or 0)
+                    order_type  = str(o.get('type', '')).lower()
+                    if fill_price > 0:
+                        reason = 'TP' if 'take_profit' in order_type else 'SL'
+                        return fill_price, reason
+        except Exception as e:
+            logger.debug(f"[倉位] _infer_exit 查歷史訂單失敗 {trade.symbol}：{e}")
+
+        # Fallback：距離啟發式
         try:
             ticker     = self.exchange.get_ticker(trade.symbol)
             last_price = float(ticker.get('last', 0))
-
             if last_price > 0:
                 sl_dist = abs(last_price - trade.sl_price)
                 tp_dist = abs(last_price - trade.tp_price)
-
                 if sl_dist <= tp_dist:
                     return trade.sl_price, 'SL'
                 else:
                     return trade.tp_price, 'TP'
         except Exception as e:
-            logger.debug(f"[倉位] _infer_exit 查詢失敗 {trade.symbol}：{e}")
+            logger.debug(f"[倉位] _infer_exit fallback 失敗 {trade.symbol}：{e}")
 
         # fallback：保守假設為止損
         return trade.sl_price, 'SL'

@@ -34,10 +34,10 @@ def _validate(s: dict):
 
     risk = s.get("risk", {})
 
-    # 槓桿上限保護
+    # 槓桿上限保護（Binance 永續合約最高 125x）
     leverage = risk.get("leverage", 1)
-    if leverage > 20:
-        raise ValueError(f"[設定錯誤] 槓桿不可超過 20x，目前設定為 {leverage}x")
+    if leverage > 125:
+        raise ValueError(f"[設定錯誤] 槓桿不可超過 125x，目前設定為 {leverage}x")
 
     # 止損不可為零
     sl = risk.get("stop_loss_pct", 0)

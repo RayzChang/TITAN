@@ -1,6 +1,6 @@
 # strategies package
 from .base_strategy import BaseStrategy
-from .ema_crossover import EMAcrossover
-from .momentum_breakout import MomentumBreakout
+from .range_breakout import RangeBreakout
+from . import candidates
 
-__all__ = ['BaseStrategy', 'EMAcrossover', 'MomentumBreakout']
+__all__ = ['BaseStrategy', 'RangeBreakout', 'candidates']

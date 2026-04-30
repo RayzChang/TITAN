@@ -1,37 +1,36 @@
 """
-Range Breakout Strategy — 箱體突破策略 v1.1
+Range Breakout Strategy — 箱體突破策略 v1.2
+TITAN v1.3 規格書實作
 
 箱體結構（層疊保留）
 --------------------
-- floor    : 原始箱體下緣，永久固定，跌破才算失效
-- ceilings : 上緣列表（由低到高），每次假突破自動新增一層
-- 任一 ceiling 被突破 → 可做多
-- floor 被跌破        → 可做空
-- floor 跌破 + 高量   → 整組箱體失效，重新偵測
+- floor     : 原始箱體下緣，永久固定（形成期最低價）
+- ceilings  : 上緣列表（由低到高），假突破確認後才新增一層
+- 任一 ceiling 被突破 + 1H 金叉 → 做多
+- floor 被跌破 + 1H 死叉         → 做空
+- floor 跌破 + 最近20日高量      → 整組箱體失效
 
-初始箱體
---------
-- 優先從 settings.yaml manual_boxes 讀取（朋友人工確認的箱體）
-- 若無手動設定，才使用 Volume-Anchored 算法自動偵測
-
-進場邏輯
---------
-- 1H MACD 交叉觸發（金叉多 / 死叉空），不需日線確認
-- 日線 MACD 僅作為加倉依據
+進場規則（防重複追單）
+-----------------------
+- 進場後記錄 base_ceiling（本次基準上緣）
+- 必須先回到 base_ceiling 下方，才允許重新進場
 
 止損（Version B）
 -----------------
-- 做多：floor × 0.99
-- 做空：最高 ceiling × 1.01
+- 做多：floor × 0.99（永久固定）
+- 做空：進場當下最高 ceiling × 1.01（凍結，不跟著延伸）
 
 止盈
 ----
-- TP1：4H MACD 反向交叉 → 平倉一半，止損移至 BE
-- TP2：BE 後 1H MACD 再次反向 → 平倉剩餘
+- TP1：4H MACD 反向交叉 → 平一半，止損移至 BE
+- TP2：TP1 後 1H MACD 再次反向 → 全平
+- TP1 觸發時若 1H 同時反向 → 直接全平，不留半倉
 
 加倉
 ----
-- 4H 連續 3 根確認 + 日線 MACD 方向一致
+- TP1 之前才可加倉（加一次）
+- 4H 連續 3 根最低 > 基準上緣
+- 最新已收日線 MACD hist > 0（多）/ < 0（空）
 """
 
 import pandas as pd
@@ -40,56 +39,49 @@ from indicators.technical import add_macd
 
 
 class RangeBreakout(BaseStrategy):
-    """
-    箱體突破策略 v1.1（層疊箱體結構）
-
-    箱體狀態（per symbol）：
-    ┌─────────────────────────────────────────────────────┐
-    │ floor     : float        — 永久下緣                  │
-    │ ceilings  : list[float]  — 上緣列表（低到高）        │
-    │ invalidated: bool        — 是否已失效（等待重建）     │
-    └─────────────────────────────────────────────────────┘
-
-    main.py 使用方式：
-        strategy.init_box(symbol)                    # 初始化箱體
-        strategy.update_data(df_4h, df_1d)           # 注入多週期資料
-        signal = strategy.calculate_signals(df, symbol)
-        action = strategy.get_management_action(symbol, open_signal)
-    """
+    """箱體突破策略 v1.2（TITAN v1.3 規格）"""
 
     def __init__(self, settings: dict):
-        cfg = settings.get('strategy', {}).get('range_breakout', {})
+        cfg = self._get_cfg(settings)
 
-        # ── 箱體偵測參數 ──────────────────────────────────────────────
         self.box_lookback      = cfg.get('box_lookback', 120)
         self.breakdown_vol_min = cfg.get('breakdown_vol_min', 1.5)
         self.sl_pct            = cfg.get('sl_pct', 3.0)
         self.addon_candles     = cfg.get('addon_candles', 3)
-
-        # 手動初始箱體設定（from settings.yaml）
         self._manual_boxes: dict = cfg.get('manual_boxes', {})
 
-        # ── 多時間週期資料 ─────────────────────────────────────────────
+        # 多時間週期資料
         self._df_4h: pd.DataFrame | None = None
         self._df_1d: pd.DataFrame | None = None
 
-        # ── 每 symbol 的箱體狀態 ──────────────────────────────────────
-        # { symbol: {'floor': float, 'ceilings': [float,...], 'invalidated': bool} }
+        # per-symbol 箱體狀態
+        # { symbol: {
+        #     floor, ceilings, invalidated,
+        #     tracking_breakout, breakout_max_high, breakout_ref_ceiling
+        # } }
         self._boxes: dict = {}
 
-        # ── 每 symbol 的持倉狀態 ──────────────────────────────────────
+        # per-symbol 持倉管理狀態（持倉期間：tp1_done, addon_done, frozen_sl）
         self._pos_states: dict = {}
 
+        # per-symbol 防重複追單狀態（獨立於 pos_state，平倉後仍保留）
+        # { symbol: {
+        #     'needs_reset': bool,   ← 是否需要先回到 ref_price 才允許再進場
+        #     'signal_dir': str,     ← 'LONG' or 'SHORT'
+        #     'ref_price': float,    ← LONG=base_ceiling, SHORT=floor
+        # } }
+        self._anti_repeat: dict = {}
+
+    @staticmethod
+    def _get_cfg(settings: dict) -> dict:
+        return settings.get('strategy', {}).get('range_breakout', {})
+
     # ==================================================================
-    # 箱體初始化（由 main.py 在啟動時對每個 symbol 呼叫一次）
+    # 箱體初始化
     # ==================================================================
 
     def init_box(self, symbol: str, df_1d: pd.DataFrame | None = None):
-        """
-        初始化指定 symbol 的箱體。
-        優先使用 manual_boxes，否則用自動偵測。
-        """
-        # 統一 symbol 格式（BTC/USDT:USDT → BTC/USDT）
+        """初始化指定 symbol 的箱體（手動種子 or 自動偵測）"""
         key = symbol.split(':')[0]
 
         if key in self._manual_boxes:
@@ -97,41 +89,49 @@ class RangeBreakout(BaseStrategy):
             floor    = float(mb['floor'])
             ceilings = sorted([float(c) for c in mb['ceilings']])
             self._boxes[symbol] = {
-                'floor':       floor,
-                'ceilings':    ceilings,
-                'invalidated': False,
+                'floor':               floor,
+                'ceilings':            ceilings,
+                'invalidated':         False,
+                'source':              'manual_seed',
+                'tracking_breakout':   False,
+                'breakout_max_high':   None,
+                'breakout_ref_ceiling': None,
             }
             from utils.logger import get_logger
             get_logger().info(
-                f"[箱體] {symbol} 手動初始化 | "
-                f"floor={floor} | ceilings={ceilings}"
+                f"[箱體] {symbol} 手動初始化 | floor={floor} | ceilings={ceilings}"
             )
         elif df_1d is not None:
             self._rebuild_box_from_data(symbol, df_1d)
         else:
-            self._boxes[symbol] = {
-                'floor': None, 'ceilings': [], 'invalidated': True
-            }
+            self._boxes[symbol] = self._empty_box()
+
+    def _empty_box(self) -> dict:
+        return {
+            'floor': None, 'ceilings': [], 'invalidated': True,
+            'source': None,
+            'tracking_breakout': False, 'breakout_max_high': None,
+            'breakout_ref_ceiling': None,
+        }
 
     # ==================================================================
     # 資料注入
     # ==================================================================
 
     def update_data(self, df_4h: pd.DataFrame, df_1d: pd.DataFrame):
-        """每週期由 main.py 注入最新多時間週期資料"""
         self._df_4h = df_4h
         self._df_1d = df_1d
 
     # ==================================================================
-    # 箱體動態更新（每週期掃描時呼叫）
+    # 箱體動態更新（R5: 假突破確認後才加層）
     # ==================================================================
 
     def update_box(self, symbol: str, current_high: float,
                    current_close: float, current_volume: float):
         """
-        根據最新 K 棒資料更新箱體狀態：
-        1. 若 high > 最高 ceiling → 新增延伸上緣
-        2. 若 close < floor AND 高量 → 箱體失效，重建
+        根據最新已收 K 棒資料更新箱體：
+        1. 上緣延伸：只在「確認假突破後」新增一層（R5）
+        2. 箱體失效：close < floor + 最近20日高量（R6）
         """
         box = self._boxes.get(symbol)
         if box is None or box['invalidated']:
@@ -139,73 +139,114 @@ class RangeBreakout(BaseStrategy):
 
         floor    = box['floor']
         ceilings = box['ceilings']
+        if not ceilings:
+            return
 
-        # ── 上緣延伸（假突破或真突破都先延伸記錄）──
-        top = ceilings[-1] if ceilings else 0
-        if current_high > top * 1.001:   # 至少突破 0.1% 才算新高
-            box['ceilings'].append(round(current_high, 2))
+        top = ceilings[-1]
 
-        # ── 箱體失效偵測 ──
+        # ── 上緣延伸狀態機（R5）──
+        if not box['tracking_breakout']:
+            # 尚未突破：若此棒收盤 > 最高上緣，進入追蹤
+            if current_close > top:
+                box['tracking_breakout']   = True
+                box['breakout_max_high']   = current_high
+                box['breakout_ref_ceiling'] = top
+        else:
+            # 正在追蹤假突破
+            if current_high > (box['breakout_max_high'] or 0):
+                box['breakout_max_high'] = current_high
+            if current_close < box['breakout_ref_ceiling']:
+                # 收盤跌回舊上緣 → 確認假突破，加入新層
+                new_ceil = round(box['breakout_max_high'], 2)
+                if new_ceil > top:
+                    box['ceilings'].append(new_ceil)
+                    from utils.logger import get_logger
+                    get_logger().info(
+                        f"[箱體] {symbol} 假突破確認 → 新上緣 {new_ceil} | "
+                        f"ceilings={box['ceilings']}"
+                    )
+                box['tracking_breakout']   = False
+                box['breakout_max_high']   = None
+                box['breakout_ref_ceiling'] = None
+
+        # ── 箱體失效偵測 (R6: 20日均量) ──
         if floor is not None and current_close < floor:
-            avg_vol = self._get_avg_volume(symbol)
+            avg_vol = self._get_avg_volume_20d()
             if avg_vol and current_volume >= avg_vol * self.breakdown_vol_min:
                 box['invalidated'] = True
                 from utils.logger import get_logger
                 get_logger().warning(
-                    f"[箱體] {symbol} 失效！close={current_close} < floor={floor} "
-                    f"vol={current_volume:.0f} >= avg×{self.breakdown_vol_min}"
+                    f"[箱體] {symbol} 失效！close={current_close:.2f} < floor={floor} "
+                    f"| vol={current_volume:.0f} >= 20日均量×{self.breakdown_vol_min:.1f}"
                 )
-                # 嘗試用日線資料重建
-                if self._df_1d is not None:
-                    self._rebuild_box_from_data(symbol, self._df_1d)
+                # 只有無持倉時才立刻重建（R2 由 main.py 在平倉後呼叫 rebuild）
 
-    def _get_avg_volume(self, symbol: str) -> float | None:
-        if self._df_1d is None or len(self._df_1d) < 10:
+    def _get_avg_volume_20d(self) -> float | None:
+        """最近 20 根已收日線的平均成交量（R6）"""
+        if self._df_1d is None or len(self._df_1d) < 5:
             return None
-        return float(self._df_1d['volume'].mean())
+        # 用 iloc[:-1] 排除今日未收完日線
+        closed = self._df_1d.iloc[:-1]
+        return float(closed['volume'].tail(20).mean())
+
+    def rebuild_box_if_invalidated(self, symbol: str) -> bool:
+        """
+        R2：若箱體失效，重建新箱體。
+        由 main.py 在平倉後呼叫，確保持倉中不切換箱體。
+        回傳是否執行了重建。
+        """
+        box = self._boxes.get(symbol)
+        if box and box['invalidated'] and self._df_1d is not None:
+            self._rebuild_box_from_data(symbol, self._df_1d)
+            return True
+        return False
 
     def _rebuild_box_from_data(self, symbol: str, df_1d: pd.DataFrame):
-        """箱體失效後，用 Volume-Anchored 算法重建新箱體"""
-        df = df_1d.tail(self.box_lookback).copy().reset_index(drop=True)
+        """Volume-Anchored 自動建箱（R8: 錨點後推保護）"""
+        df = df_1d.iloc[:-1].tail(self.box_lookback).copy().reset_index(drop=True)
         if len(df) < 10:
+            self._boxes[symbol] = self._empty_box()
             return
 
-        avg_vol    = df['volume'].mean()
-        anchor_idx = int(df['volume'].idxmax())
-        form_end   = min(anchor_idx + 5, len(df) - 1)
+        # R8：錨點候選必須後面至少還有 4 根已收日線
+        vol = df['volume'].copy()
+        anchor_idx = None
+        for _ in range(len(df)):
+            candidate = int(vol.idxmax())
+            if candidate + 4 < len(df):
+                anchor_idx = candidate
+                break
+            vol.iloc[candidate] = 0  # 移除這個候選，找次大
 
+        if anchor_idx is None:
+            self._boxes[symbol] = self._empty_box()
+            return
+
+        form_end = min(anchor_idx + 5, len(df) - 1)
         floor    = float(df['low'].iloc[anchor_idx:form_end + 1].min())
         ceiling  = float(df['high'].iloc[anchor_idx:form_end + 1].max())
-        # running max from anchor
-        final_ceil = float(df['high'].iloc[anchor_idx:].max())
-
-        ceilings = sorted(set([ceiling, final_ceil]))
 
         self._boxes[symbol] = {
-            'floor':       floor,
-            'ceilings':    ceilings,
-            'invalidated': False,
+            'floor':               floor,
+            'ceilings':            [ceiling],
+            'invalidated':         False,
+            'source':              'auto_rebuild',
+            'tracking_breakout':   False,
+            'breakout_max_high':   None,
+            'breakout_ref_ceiling': None,
         }
         from utils.logger import get_logger
         get_logger().info(
-            f"[箱體] {symbol} 自動重建 | floor={floor} | ceilings={ceilings}"
+            f"[箱體] {symbol} 自動重建 | floor={floor:.2f} | ceilings=[{ceiling:.2f}]"
         )
 
     # ==================================================================
-    # 進場信號（1H MACD）
+    # 進場訊號（1H MACD 已收線）
     # ==================================================================
 
     def calculate_signals(self, df: pd.DataFrame, symbol: str = '') -> str:
         """
-        計算 1H 進場信號。
-
-        做多條件：
-          - 現價 > 任一 ceiling（突破任一上緣）
-          - 1H MACD 金叉
-
-        做空條件：
-          - 現價 < floor（跌破永久下緣）
-          - 1H MACD 死叉
+        計算 1H 進場訊號（只用已收完 K 棒 → iloc[-2], iloc[-3]）
 
         Returns: 'LONG' / 'SHORT' / 'HOLD'
         """
@@ -215,7 +256,8 @@ class RangeBreakout(BaseStrategy):
 
         if floor is None or not ceilings:
             return 'HOLD'
-
+        if box.get('invalidated'):
+            return 'HOLD'
         if df is None or len(df) < 40:
             return 'HOLD'
 
@@ -223,8 +265,9 @@ class RangeBreakout(BaseStrategy):
         if 'macd_hist' not in df.columns:
             df = add_macd(df)
 
-        last = df.iloc[-1]
-        prev = df.iloc[-2]
+        # 只用已收完 K 棒（iloc[-2]=最後已收, iloc[-3]=前一根）
+        last = df.iloc[-2]
+        prev = df.iloc[-3]
 
         hist_now  = float(last.get('macd_hist', 0) or 0)
         hist_prev = float(prev.get('macd_hist', 0) or 0)
@@ -236,21 +279,51 @@ class RangeBreakout(BaseStrategy):
         gold_cross = hist_now > 0 and hist_prev <= 0
         dead_cross = hist_now < 0 and hist_prev >= 0
 
-        # ── 做多：突破任一上緣 + 金叉 ────────────────────────────────
-        top_ceiling = ceilings[-1]
-        if close > top_ceiling and gold_cross:
-            return 'LONG'
+        # ── 防重複追單（R1）── 獨立於 pos_state，平倉後仍生效
+        ar = self._anti_repeat.get(symbol)
+        if ar and ar.get('needs_reset'):
+            ref   = ar.get('ref_price')
+            sdir  = ar.get('signal_dir', 'LONG')
+            reset = False
+            if sdir == 'LONG'  and ref and close < ref:
+                reset = True
+            elif sdir == 'SHORT' and ref and close > ref:
+                reset = True
+            if reset:
+                ar['needs_reset'] = False
+            else:
+                return 'HOLD'
 
-        # 次級上緣：突破任一中間層也可進場
-        for ceil in ceilings[:-1]:
-            if close > ceil and gold_cross:
+        # ── 做多：突破任一上緣 + 金叉 ──
+        if gold_cross:
+            triggered_ceil = None
+            for ceil in sorted(ceilings, reverse=True):
+                if close > ceil:
+                    triggered_ceil = ceil
+                    break
+            if triggered_ceil is not None:
                 return 'LONG'
 
-        # ── 做空：跌破 floor + 死叉 ──────────────────────────────────
+        # ── 做空：跌破 floor + 死叉 ──
         if close < floor and dead_cross:
             return 'SHORT'
 
         return 'HOLD'
+
+    def get_triggered_ceiling(self, df: pd.DataFrame, symbol: str) -> float | None:
+        """回傳本次進場觸發的基準上緣（供 main.py 記錄 base_ceiling）"""
+        box = self._boxes.get(symbol, {})
+        ceilings = box.get('ceilings', [])
+        if df is None or len(df) < 2 or not ceilings:
+            return None
+        df = df.copy()
+        if 'macd_hist' not in df.columns:
+            df = add_macd(df)
+        close = float(df.iloc[-2]['close'])
+        for ceil in sorted(ceilings, reverse=True):
+            if close > ceil:
+                return ceil
+        return None
 
     # ==================================================================
     # 止損 / 止盈
@@ -260,8 +333,8 @@ class RangeBreakout(BaseStrategy):
                       symbol: str = '') -> float:
         """
         Version B 止損：
-          LONG : floor × 0.99
-          SHORT: 最高 ceiling × 1.01
+          LONG : floor × 0.99（永久固定）
+          SHORT: 進場當下最高 ceiling × 1.01（由 main.py 凍結後傳入）
         """
         box      = self._boxes.get(symbol, {})
         floor    = box.get('floor')
@@ -272,65 +345,131 @@ class RangeBreakout(BaseStrategy):
         if signal == 'SHORT' and ceilings:
             return self._round(ceilings[-1] * 1.01)
 
-        # fallback
         dist = entry_price * (self.sl_pct / 100)
         return self._round(entry_price - dist if signal == 'LONG'
                            else entry_price + dist)
 
+    def get_frozen_short_sl(self, symbol: str) -> float | None:
+        """R3：取得做空時凍結的止損價（進場當下記錄的，不隨延伸變動）"""
+        return self._pos_states.get(symbol, {}).get('frozen_sl_ceiling')
+
     def get_take_profit(self, entry_price: float, signal: str,
                         symbol: str = '') -> float:
-        """初始掛單 TP = 6%（TP1 由 4H MACD 實際觸發覆蓋）"""
+        """初始掛單 TP = sl_pct × 2（TP1 由 4H MACD 觸發覆蓋）"""
         dist = entry_price * (self.sl_pct * 2 / 100)
         if signal == 'LONG':
             return self._round(entry_price + dist)
         return self._round(entry_price - dist)
 
     # ==================================================================
-    # 持倉管理
+    # 持倉管理狀態（進場 / 平倉 / 查詢）
+    # ==================================================================
+
+    def on_position_opened(self, symbol: str, signal: str,
+                           base_ceiling: float | None = None):
+        """
+        進場後登記持倉狀態 + 防重複追單狀態。
+        由 main.py 在開倉成功後呼叫。
+        """
+        box   = self._boxes.get(symbol, {})
+        floor = box.get('floor')
+        ceilings = box.get('ceilings', [])
+
+        # 凍結做空止損（R3）
+        frozen_ceil = ceilings[-1] if (signal == 'SHORT' and ceilings) else None
+
+        self._pos_states[symbol] = {
+            'tp1_done':          False,
+            'addon_done':        False,
+            'frozen_sl_ceiling': frozen_ceil,
+        }
+
+        # 防重複追單：LONG → 回到 base_ceiling 下方，SHORT → 回到 floor 上方
+        ref_price = base_ceiling if signal == 'LONG' else floor
+        self._anti_repeat[symbol] = {
+            'needs_reset': True,
+            'signal_dir':  signal,
+            'ref_price':   ref_price,
+        }
+
+    def on_position_closed(self, symbol: str):
+        """平倉後清除持倉狀態（anti_repeat 保留，直到回箱體才清）"""
+        self._pos_states.pop(symbol, None)
+        # 注意：不清 _anti_repeat，讓它繼續擋重複進場
+
+    def get_pos_state(self, symbol: str) -> dict:
+        return dict(self._pos_states.get(symbol, {}))
+
+    def restore_pos_state(self, symbol: str, state: dict):
+        """啟動對帳時恢復 pos_state（從 state.json）"""
+        self._pos_states[symbol] = state
+
+    def get_anti_repeat_state(self, symbol: str) -> dict:
+        """供 main.py 讀取並寫入 state.json（Fix 4）"""
+        return dict(self._anti_repeat.get(symbol, {}))
+
+    def restore_anti_repeat(self, symbol: str, state: dict):
+        """啟動對帳時恢復 anti_repeat（從 state.json）"""
+        self._anti_repeat[symbol] = state
+
+    # ==================================================================
+    # 持倉管理動作（TP1 / TP2 / addon）
     # ==================================================================
 
     def get_management_action(self, symbol: str, signal: str) -> dict:
         """
         回傳對現有持倉應採取的動作。
-          tp1    : 4H MACD 反向交叉 → 止盈一半 + 止損移至 BE
-          reduce : 日線 MACD 反向   → 減半倉
-          addon  : 4H 連續確認      → 加倉
+        只用已收完 K 棒。
+
+        Returns dict with keys:
+          tp1    : bool — 4H 反向 → 平倉一半 + SL 移至 BE
+          tp2    : bool — TP1 後 1H 反向 → 全平（第二段出場）
+          tp1_and_tp2: bool — TP1 觸發時 1H 也反向 → 直接全平（R4）
+          addon  : bool — 加倉條件成立
         """
         state  = self._pos_states.setdefault(
-            symbol, {'tp1_done': False, 'addon_done': False}
+            symbol, {
+                'tp1_done': False, 'addon_done': False,
+                'base_ceiling': None, 'needs_reentry_reset': False,
+                'frozen_sl_ceiling': None,
+            }
         )
-        result = {'tp1': False, 'reduce': False, 'addon': False}
+        result = {'tp1': False, 'tp2': False, 'tp1_and_tp2': False, 'addon': False}
 
-        if not state['tp1_done'] and self._has_4h_reversal(signal):
-            result['tp1']     = True
-            state['tp1_done'] = True
+        if not state['tp1_done']:
+            if self._has_4h_reversal(signal):
+                # R4：TP1 觸發時若 1H 也反向 → 直接全平
+                if self._has_1h_reversal(signal):
+                    result['tp1_and_tp2'] = True
+                else:
+                    result['tp1'] = True
+                state['tp1_done'] = True
+        else:
+            # 第二段出場：1H 反向
+            if self._has_1h_reversal(signal):
+                result['tp2'] = True
 
-        if self._has_daily_reversal(signal):
-            result['reduce'] = True
-
-        if not state['addon_done'] and self._check_addon(signal, symbol):
-            result['addon']      = True
-            state['addon_done']  = True
+        # addon：TP1 之前才可加倉（R11）
+        if not state['tp1_done'] and not state['addon_done']:
+            if self._check_addon(signal, symbol):
+                result['addon']     = True
+                state['addon_done'] = True
 
         return result
 
     def clear_position_state(self, symbol: str):
-        self._pos_states.pop(symbol, None)
+        """alias，相容舊呼叫"""
+        self.on_position_closed(symbol)
 
     # ==================================================================
     # 查詢介面
     # ==================================================================
 
     def get_box(self, symbol: str = '') -> tuple:
-        """
-        回傳 (floor, top_ceiling) 供 main.py 顯示用。
-        舊版相容：若無 symbol 則回傳第一個箱體。
-        """
         if symbol and symbol in self._boxes:
             box = self._boxes[symbol]
             top = box['ceilings'][-1] if box['ceilings'] else None
             return top, box['floor']
-        # 舊版相容（單箱體模式）
         if self._boxes:
             box = next(iter(self._boxes.values()))
             top = box['ceilings'][-1] if box['ceilings'] else None
@@ -338,22 +477,48 @@ class RangeBreakout(BaseStrategy):
         return None, None
 
     def get_box_detail(self, symbol: str) -> dict:
-        """回傳完整箱體資訊"""
         return self._boxes.get(symbol, {})
+
+    def is_box_invalidated(self, symbol: str) -> bool:
+        return self._boxes.get(symbol, {}).get('invalidated', False)
 
     # ==================================================================
     # 私有輔助
     # ==================================================================
 
     def _has_4h_reversal(self, signal: str) -> bool:
+        """4H MACD 反向交叉（只用已收線 iloc[-2]/-3）"""
         df4 = self._df_4h
         if df4 is None or len(df4) < 40:
             return False
         df4 = df4.copy()
         if 'macd_hist' not in df4.columns:
             df4 = add_macd(df4)
-        h_now  = float(df4['macd_hist'].iloc[-1])
-        h_prev = float(df4['macd_hist'].iloc[-2])
+        h_now  = float(df4['macd_hist'].iloc[-2])
+        h_prev = float(df4['macd_hist'].iloc[-3])
+        if pd.isna(h_now) or pd.isna(h_prev):
+            return False
+        if signal == 'LONG':
+            return h_now < 0 and h_prev >= 0
+        if signal == 'SHORT':
+            return h_now > 0 and h_prev <= 0
+        return False
+
+    def _has_1h_reversal(self, signal: str) -> bool:
+        """1H MACD 反向交叉（只用已收線 iloc[-2]/-3）"""
+        # 1H 資料由 df 參數注入，這裡需要暫存
+        # 由 update_data 注入的 _df_4h 是 4H；1H 要由 main.py 另外傳
+        # 暫時 False，等 update_data 同時注入 df_1h 後再啟用
+        df1h = getattr(self, '_df_1h', None)
+        if df1h is None or len(df1h) < 40:
+            return False
+        df1h = df1h.copy()
+        if 'macd_hist' not in df1h.columns:
+            df1h = add_macd(df1h)
+        h_now  = float(df1h['macd_hist'].iloc[-2])
+        h_prev = float(df1h['macd_hist'].iloc[-3])
+        if pd.isna(h_now) or pd.isna(h_prev):
+            return False
         if signal == 'LONG':
             return h_now < 0 and h_prev >= 0
         if signal == 'SHORT':
@@ -361,14 +526,17 @@ class RangeBreakout(BaseStrategy):
         return False
 
     def _has_daily_reversal(self, signal: str) -> bool:
+        """日線 MACD 反向（只用已收線 iloc[-2]/-3）"""
         df1d = self._df_1d
         if df1d is None or len(df1d) < 40:
             return False
         df1d = df1d.copy()
         if 'macd_hist' not in df1d.columns:
             df1d = add_macd(df1d)
-        h_now  = float(df1d['macd_hist'].iloc[-1])
-        h_prev = float(df1d['macd_hist'].iloc[-2])
+        h_now  = float(df1d['macd_hist'].iloc[-2])
+        h_prev = float(df1d['macd_hist'].iloc[-3])
+        if pd.isna(h_now) or pd.isna(h_prev):
+            return False
         if signal == 'LONG':
             return h_now < 0 and h_prev >= 0
         if signal == 'SHORT':
@@ -376,21 +544,54 @@ class RangeBreakout(BaseStrategy):
         return False
 
     def _check_addon(self, signal: str, symbol: str = '') -> bool:
+        """
+        加倉條件（R7: 加上日線 MACD 持續狀態）：
+        - 連續 addon_candles 根已收 4H K 棒確認方向
+        - 最新已收日線 MACD hist > 0（多）/ < 0（空）
+        """
         box      = self._boxes.get(symbol, {})
         floor    = box.get('floor')
         ceilings = box.get('ceilings', [])
         if not floor or not ceilings:
             return False
+
         df4 = self._df_4h
-        if df4 is None or len(df4) < self.addon_candles:
+        if df4 is None or len(df4) < self.addon_candles + 1:
             return False
-        recent = df4.tail(self.addon_candles)
+
+        # 只取已收棒（排除最後一根正在形成的）
+        closed_4h = df4.iloc[:-1].tail(self.addon_candles)
         top = ceilings[-1]
+
         if signal == 'LONG':
-            return bool((recent['low'] > top).all())
+            price_ok = bool((closed_4h['low'] > top).all())
+        elif signal == 'SHORT':
+            price_ok = bool((closed_4h['high'] < floor).all())
+        else:
+            return False
+
+        if not price_ok:
+            return False
+
+        # R7：日線 MACD 持續狀態
+        df1d = self._df_1d
+        if df1d is None or len(df1d) < 30:
+            return False
+        df1d = df1d.copy()
+        if 'macd_hist' not in df1d.columns:
+            df1d = add_macd(df1d)
+        daily_hist = float(df1d['macd_hist'].iloc[-2])  # 最新已收日線
+        if pd.isna(daily_hist):
+            return False
+        if signal == 'LONG':
+            return daily_hist > 0
         if signal == 'SHORT':
-            return bool((recent['high'] < floor).all())
+            return daily_hist < 0
         return False
+
+    def update_1h_data(self, df_1h: pd.DataFrame):
+        """供 main.py 注入 1H 資料，供 _has_1h_reversal 使用"""
+        self._df_1h = df_1h
 
     @staticmethod
     def _round(price: float) -> float:
@@ -409,4 +610,4 @@ class RangeBreakout(BaseStrategy):
             top = box['ceilings'][-1] if box['ceilings'] else '?'
             parts.append(f"{sym.split('/')[0]}: {box['floor']}~{top}")
         box_str = ' | '.join(parts) if parts else '箱體未初始化'
-        return f"RangeBreakout v1.1 | {box_str}"
+        return f"RangeBreakout v1.2 | {box_str}"
