@@ -39,3 +39,4 @@ state.json
 .claude/scheduled_tasks.lock
 .claude/settings.local.json
 data/_archive/
+data/r3_cache/
