@@ -34,6 +34,12 @@ timeframes:
 # 3. Regime Filter (§3)
 # -------------------------------------------------------------
 regime:
+  # ----- 4H 趨勢過濾指標（Spec §3.1, §3.2）-----
+  trend_filter_indicators:
+    ema_short_period: 50
+    ema_long_period: 200
+    adx_period: 14
+
   # ----- A 趨勢盤 -----
   a_trend:
     adx_4h_min: 22
