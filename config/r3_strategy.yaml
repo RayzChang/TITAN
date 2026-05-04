@@ -163,7 +163,10 @@ trend_pullback:
   # ----- 進場掛單 (Q12, Q26, Q27) -----
   entry_order:
     mode: "limit_maker_pullback"
+    order_type: "LIMIT_MAKER"
+    time_in_force: "GTX"
     timeout_5m_bars: 2                    # Q12
+    atr_offset_mult: 0.1
     chase_allowed: false                  # Q12
     quantity_basis: "limit_price"         # Q26
     partial_fill:
@@ -193,6 +196,7 @@ trend_pullback:
       exit_pct: 50
       move_sl_to: "breakeven"
     tp2:
+      tp2_r: 2.75
       r_multiple_min: 2.5
       r_multiple_max: 3.0
     trailing_after_2r:
@@ -313,6 +317,7 @@ trailing:
   trigger:
     method: "intrabar_hit"
     live_order_type: "STOP_MARKET"
+    time_in_force: "GTC"
     reduce_only: true
 
 # -------------------------------------------------------------
