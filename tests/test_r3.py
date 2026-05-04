@@ -26,6 +26,7 @@ import pytest
 
 from strategies.r3.config_loader import R3Config
 from strategies.r3 import indicators as ind
+from strategies.r3.confirmation import TrendConfirmation5M
 from strategies.r3.data_loader import (
     R3DataLoader,
     IntegrityReport,
@@ -35,7 +36,17 @@ from strategies.r3.data_loader import (
     _symbol_to_filename,
     TIMEFRAME_TO_SECONDS,
 )
+from strategies.r3.executor import OrderIntent, PartialFillSimulator, TrendOrderIntentBuilder
 from strategies.r3.exchange import R3ExchangeData
+from strategies.r3.regime import Direction, Regime, RegimeState
+from strategies.r3.risk_engine import RiskEngine
+from strategies.r3.trailing import TrendStopExitBuilder
+from strategies.r3.trend_pullback import (
+    TrendPullbackStrategy,
+    evaluate_pullback_zone,
+    evaluate_rsi_rebound,
+    evaluate_signal_window,
+)
 
 
 # ---------------------------------------------------------------
@@ -44,6 +55,94 @@ from strategies.r3.exchange import R3ExchangeData
 @pytest.fixture(scope="module")
 def cfg() -> R3Config:
     return R3Config.load()
+
+
+def _one_row_1h(
+    *,
+    low: float = 99.8,
+    high: float = 100.2,
+    close: float = 100.0,
+    ema20: float = 100.0,
+    ema50: float = 95.0,
+    rsi_value: float = 51.0,
+    atr_value: float = 1.0,
+) -> pd.DataFrame:
+    return pd.DataFrame({
+        "open": [close],
+        "high": [high],
+        "low": [low],
+        "close": [close],
+        "volume": [100.0],
+        "ema_20": [ema20],
+        "ema_50": [ema50],
+        "rsi_14": [rsi_value],
+        "atr_14": [atr_value],
+    }, index=[datetime(2026, 1, 1, tzinfo=timezone.utc)])
+
+
+def _rsi_1h(values: list[float]) -> pd.DataFrame:
+    idx = pd.date_range(datetime(2026, 1, 1, tzinfo=timezone.utc), periods=len(values), freq="1h")
+    return pd.DataFrame({
+        "open": [100.0] * len(values),
+        "high": [101.0] * len(values),
+        "low": [99.0] * len(values),
+        "close": [100.0] * len(values),
+        "volume": [100.0] * len(values),
+        "ema_20": [100.0] * len(values),
+        "ema_50": [95.0] * len(values),
+        "rsi_14": values,
+        "atr_14": [1.0] * len(values),
+    }, index=idx)
+
+
+def _trend_5m_df(direction: str = "long") -> pd.DataFrame:
+    idx = pd.date_range(datetime(2026, 1, 1, 5, 0, tzinfo=timezone.utc), periods=10, freq="5min")
+    if direction == "long":
+        closes = [100.0, 100.1, 100.2, 100.3, 100.4, 100.5, 100.6, 100.7, 100.8, 101.5]
+        opens = [c - 0.1 for c in closes]
+        highs = [c + 0.1 for c in closes]
+        lows = [c - 0.2 for c in closes]
+    else:
+        closes = [100.0, 99.9, 99.8, 99.7, 99.6, 99.5, 99.4, 99.3, 99.2, 98.5]
+        opens = [c + 0.1 for c in closes]
+        highs = [c + 0.2 for c in closes]
+        lows = [c - 0.1 for c in closes]
+    return pd.DataFrame({
+        "open": opens,
+        "high": highs,
+        "low": lows,
+        "close": closes,
+        "volume": [100.0] * len(closes),
+        "atr_14": [0.5] * len(closes),
+    }, index=idx)
+
+
+def _manual_regime_state(
+    *,
+    regime: Regime = Regime.A_TREND,
+    direction: str = Direction.LONG.value,
+    allow_new_entries: bool = True,
+    funding_z: float = 0.5,
+    extreme_vol: bool = False,
+) -> RegimeState:
+    ema_short = 100.0 if direction == Direction.LONG.value else 90.0
+    ema_long = 90.0 if direction == Direction.LONG.value else 100.0
+    return RegimeState(
+        as_of=datetime(2026, 1, 1, 5, 5, tzinfo=timezone.utc),
+        symbol="BTC/USDT:USDT",
+        regime=regime,
+        regime_name="trend" if regime == Regime.A_TREND else "other",
+        direction=direction,
+        allow_new_entries=allow_new_entries,
+        reason_codes=[regime.value],
+        metrics_snapshot={
+            "ema_4h_short": ema_short,
+            "ema_4h_long": ema_long,
+            "adx_4h": 30.0,
+            "funding_z": funding_z,
+            "extreme_vol": extreme_vol,
+        },
+    )
 
 
 # ===============================================================
@@ -68,16 +167,44 @@ class TestQ21EMAPullbackZone:
         assert cfg.trend_pullback.entry.ema_band_atr_mult == 0.3
 
     def test_long_pullback_touches_ema_within_band_should_qualify(self, cfg):
-        pytest.skip("TODO[Sprint-3]: implement after indicators.ema_pullback_zone")
+        df = _one_row_1h(low=100.2, close=100.1, ema20=100.0, ema50=95.0)
+        result = evaluate_pullback_zone(df, cfg, "long")
+        assert result.passed is True
+        assert result.matched_ema == "ema_20"
+        assert "PULLBACK_TO_EMA20" in result.reason_codes
 
     def test_long_pullback_low_too_far_from_ema_should_not_qualify(self, cfg):
-        pytest.skip("TODO[Sprint-3]: low > EMA + 0.3 ATR should fail")
+        df = _one_row_1h(low=100.4, close=100.1, ema20=100.0, ema50=95.0)
+        result = evaluate_pullback_zone(df, cfg, "long")
+        assert result.passed is False
+        assert "NO_VALID_PULLBACK" in result.reason_codes
 
     def test_long_close_outside_band_should_not_qualify(self, cfg):
-        pytest.skip("TODO[Sprint-3]: close beyond EMA ± 0.3 ATR should fail")
+        df = _one_row_1h(low=100.1, close=100.5, ema20=100.0, ema50=95.0)
+        result = evaluate_pullback_zone(df, cfg, "long")
+        assert result.passed is False
+        assert "NO_VALID_PULLBACK" in result.reason_codes
 
     def test_short_symmetric(self, cfg):
-        pytest.skip("TODO[Sprint-3]: short side mirror logic")
+        df = _one_row_1h(high=99.8, close=99.9, ema20=100.0, ema50=105.0)
+        result = evaluate_pullback_zone(df, cfg, "short")
+        assert result.passed is True
+        assert result.matched_ema == "ema_20"
+        assert "PULLBACK_TO_EMA20" in result.reason_codes
+
+    def test_long_pullback_to_ema50_should_qualify(self, cfg):
+        df = _one_row_1h(low=95.2, close=95.1, ema20=105.0, ema50=95.0)
+        result = evaluate_pullback_zone(df, cfg, "long")
+        assert result.passed is True
+        assert result.matched_ema == "ema_50"
+        assert "PULLBACK_TO_EMA50" in result.reason_codes
+
+    def test_short_pullback_to_ema50_should_qualify(self, cfg):
+        df = _one_row_1h(high=105.2, close=105.1, ema20=95.0, ema50=105.0)
+        result = evaluate_pullback_zone(df, cfg, "short")
+        assert result.passed is True
+        assert result.matched_ema == "ema_50"
+        assert "PULLBACK_TO_EMA50" in result.reason_codes
 
 
 # ===============================================================
@@ -95,16 +222,29 @@ class TestQ22RSIUptickFromZone:
         assert cfg.trend_pullback.entry.rsi_threshold == 50
 
     def test_rsi_was_below_50_now_above_should_qualify(self, cfg):
-        pytest.skip("TODO[Sprint-3]: RSI history [42, 47, 49, 51, 53] should pass")
+        result = evaluate_rsi_rebound(_rsi_1h([55, 49, 48, 50, 51]), cfg, "long")
+        assert result.passed is True
+        assert "RSI_REBOUNDED_LONG" in result.reason_codes
 
     def test_rsi_never_below_50_should_not_qualify(self, cfg):
-        pytest.skip("TODO[Sprint-3]: RSI history [55, 56, 57, 58, 59] should fail")
+        result = evaluate_rsi_rebound(_rsi_1h([55, 56, 57, 58, 59]), cfg, "long")
+        assert result.passed is False
+        assert "RSI_CONDITION_FAILED" in result.reason_codes
 
     def test_rsi_below_50_but_not_uptick_should_not_qualify(self, cfg):
-        pytest.skip("TODO[Sprint-3]: RSI [42, 47, 51, 50, 49] should fail (no uptick)")
+        result = evaluate_rsi_rebound(_rsi_1h([42, 47, 51, 50, 49]), cfg, "long")
+        assert result.passed is False
+        assert "RSI_CONDITION_FAILED" in result.reason_codes
 
     def test_short_symmetric(self, cfg):
-        pytest.skip("TODO[Sprint-3]: short side: max ≥ 50 + downtick + < 50")
+        result = evaluate_rsi_rebound(_rsi_1h([45, 52, 55, 51, 49]), cfg, "short")
+        assert result.passed is True
+        assert "RSI_REJECTED_SHORT" in result.reason_codes
+
+    def test_short_without_downtick_should_not_qualify(self, cfg):
+        result = evaluate_rsi_rebound(_rsi_1h([55, 54, 49, 48, 49]), cfg, "short")
+        assert result.passed is False
+        assert "RSI_CONDITION_FAILED" in result.reason_codes
 
 
 # ===============================================================
@@ -115,10 +255,19 @@ class TestQ23SignalValidityWindow:
         assert cfg.trend_pullback.signal_validity_window_5m_bars == 12
 
     def test_signal_at_5m_bar_1_to_12_is_valid(self, cfg):
-        pytest.skip("TODO[Sprint-3]: window 1..12 valid")
+        signal_close = datetime(2026, 1, 1, 5, 0, tzinfo=timezone.utc)
+        for bar in range(1, 13):
+            current = signal_close + timedelta(minutes=5 * bar)
+            result = evaluate_signal_window(signal_close, current, cfg)
+            assert result.passed is True
+            assert "SIGNAL_WINDOW_VALID" in result.reason_codes
 
     def test_signal_at_5m_bar_13_should_be_invalid(self, cfg):
-        pytest.skip("TODO[Sprint-3]: bar 13 fails, must wait next 1H")
+        signal_close = datetime(2026, 1, 1, 5, 0, tzinfo=timezone.utc)
+        current = signal_close + timedelta(minutes=65)
+        result = evaluate_signal_window(signal_close, current, cfg)
+        assert result.passed is False
+        assert "SIGNAL_WINDOW_EXPIRED" in result.reason_codes
 
 
 # ===============================================================
@@ -133,10 +282,10 @@ class TestQ24OppositePositionForbidden:
         assert opp.wait_until_existing_closed is True
 
     def test_btc_long_held_short_signal_should_be_rejected(self, cfg):
-        pytest.skip("TODO[Sprint-3]: with BTC long open, BTC short signal must be rejected")
+        pytest.skip("TODO[Sprint-4-or-Router]: with BTC long open, BTC short signal must be rejected")
 
     def test_after_existing_closed_new_direction_allowed(self, cfg):
-        pytest.skip("TODO[Sprint-3]: after TP/SL exit, opposite direction signal allowed")
+        pytest.skip("TODO[Sprint-4-or-Router]: after TP/SL exit, opposite direction signal allowed")
 
 
 # ===============================================================
@@ -179,7 +328,19 @@ class TestQ26QuantityFromLimitPrice:
         assert cfg.trend_pullback.entry_order.quantity_basis == "limit_price"
 
     def test_quantity_formula_uses_limit_price_not_current(self, cfg):
-        pytest.skip("TODO[Sprint-3]: risk_amount / |limit-stop| = qty (NOT using current bid)")
+        engine = RiskEngine(cfg)
+        plan = engine.build_plan(
+            symbol="BTC/USDT:USDT",
+            direction="long",
+            equity=5000.0,
+            entry_price=100.0,
+            stop_price=98.0,
+        )
+        assert plan.approved is True
+        assert plan.risk_amount == pytest.approx(37.5)
+        assert plan.stop_loss_pct == pytest.approx(0.02)
+        assert plan.position_notional == pytest.approx(1875.0)
+        assert plan.quantity == pytest.approx(18.75)
 
 
 # ===============================================================
@@ -192,13 +353,67 @@ class TestQ27PartialFill:
         assert pf.cancel_remaining_after_timeout is True
 
     def test_filled_portion_immediately_protected_by_sl(self, cfg):
-        pytest.skip("TODO[Sprint-3]: partial fill -> immediate reduce-only SL")
+        order = OrderIntent(
+            symbol="BTC/USDT:USDT",
+            direction="long",
+            order_type="LIMIT_MAKER",
+            time_in_force="GTX",
+            limit_price=100.0,
+            quantity=10.0,
+            reduce_only=False,
+            signal_id="sig-1",
+        )
+        sim = PartialFillSimulator(cfg).simulate(
+            order,
+            filled_quantity=4.0,
+            entry_price=100.0,
+            stop_price=98.0,
+            timeout_reached=False,
+        )
+        assert sim.stop_order_intent is not None
+        assert sim.stop_order_intent.reduce_only is True
+        assert sim.stop_order_intent.quantity == pytest.approx(4.0)
 
     def test_unfilled_portion_canceled_at_timeout(self, cfg):
-        pytest.skip("TODO[Sprint-3]: 2-bar timeout -> cancel remaining qty")
+        order = OrderIntent(
+            symbol="BTC/USDT:USDT",
+            direction="long",
+            order_type="LIMIT_MAKER",
+            time_in_force="GTX",
+            limit_price=100.0,
+            quantity=10.0,
+            reduce_only=False,
+            signal_id="sig-1",
+        )
+        sim = PartialFillSimulator(cfg).simulate(
+            order,
+            filled_quantity=4.0,
+            entry_price=100.0,
+            stop_price=98.0,
+            timeout_reached=True,
+        )
+        assert sim.remaining_quantity == pytest.approx(6.0)
+        assert sim.cancel_remaining_after_timeout is True
 
     def test_r_multiple_uses_actual_filled_qty(self, cfg):
-        pytest.skip("TODO[Sprint-3]: R = filled_qty * sl_distance, not requested_qty")
+        order = OrderIntent(
+            symbol="BTC/USDT:USDT",
+            direction="long",
+            order_type="LIMIT_MAKER",
+            time_in_force="GTX",
+            limit_price=100.0,
+            quantity=10.0,
+            reduce_only=False,
+            signal_id="sig-1",
+        )
+        sim = PartialFillSimulator(cfg).simulate(
+            order,
+            filled_quantity=4.0,
+            entry_price=100.0,
+            stop_price=98.0,
+            timeout_reached=True,
+        )
+        assert sim.max_loss == pytest.approx(8.0)
 
 
 # ===============================================================
@@ -212,10 +427,18 @@ class TestQ28EquityBasis:
         assert "unrealized_pnl" in formula
 
     def test_positive_unrealized_does_not_inflate_equity(self, cfg):
-        pytest.skip("TODO[Sprint-3]: wallet=5000, +unrealized=200 -> equity=5000 (not 5200)")
+        assert RiskEngine(cfg).compute_equity(
+            wallet_balance=5000.0,
+            realized_pnl=0.0,
+            unrealized_pnl=200.0,
+        ) == pytest.approx(5000.0)
 
     def test_negative_unrealized_immediately_reduces_equity(self, cfg):
-        pytest.skip("TODO[Sprint-3]: wallet=5000, -unrealized=300 -> equity=4700")
+        assert RiskEngine(cfg).compute_equity(
+            wallet_balance=5000.0,
+            realized_pnl=0.0,
+            unrealized_pnl=-300.0,
+        ) == pytest.approx(4700.0)
 
 
 # ===============================================================
@@ -228,13 +451,13 @@ class TestQ29SameStrategyCooldown:
         assert cd.tp_exit_1h_bars == 0
 
     def test_sl_exit_blocks_next_1h_signal(self, cfg):
-        pytest.skip("TODO[Sprint-3]: BTC trend SL at T -> reject BTC trend signal at T+1H")
+        pytest.skip("TODO[Sprint-4-or-RiskSession]: BTC trend SL at T -> reject BTC trend signal at T+1H")
 
     def test_tp_exit_does_not_block(self, cfg):
-        pytest.skip("TODO[Sprint-3]: BTC trend TP at T -> allow BTC trend signal at T+1H")
+        pytest.skip("TODO[Sprint-4-or-RiskSession]: BTC trend TP at T -> allow BTC trend signal at T+1H")
 
     def test_cooldown_only_applies_per_symbol_per_strategy(self, cfg):
-        pytest.skip("TODO[Sprint-3]: BTC SL does not block ETH trend, nor BTC mean_reversion")
+        pytest.skip("TODO[Sprint-4-or-RiskSession]: BTC SL does not block ETH trend, nor BTC mean_reversion")
 
 
 # ===============================================================
@@ -242,6 +465,301 @@ class TestQ29SameStrategyCooldown:
 # Sprint 1 — Data Layer
 # ===============================================================
 # ===============================================================
+
+class TestSprint3Confirmation:
+    def test_long_three_conditions_any_two_pass(self, cfg):
+        result = TrendConfirmation5M(cfg).check(
+            _trend_5m_df("long"),
+            datetime(2026, 1, 1, 5, 45, tzinfo=timezone.utc),
+            "BTC/USDT:USDT",
+            "long",
+        )
+        assert result.passed is True
+        assert len(result.conditions_passed) >= 2
+
+    def test_short_three_conditions_any_two_pass(self, cfg):
+        result = TrendConfirmation5M(cfg).check(
+            _trend_5m_df("short"),
+            datetime(2026, 1, 1, 5, 45, tzinfo=timezone.utc),
+            "BTC/USDT:USDT",
+            "short",
+        )
+        assert result.passed is True
+        assert len(result.conditions_passed) >= 2
+
+    def test_only_one_condition_does_not_pass(self, cfg):
+        idx = pd.date_range(datetime(2026, 1, 1, tzinfo=timezone.utc), periods=10, freq="5min")
+        df = pd.DataFrame({
+            "open": [100.0] * 9 + [100.05],
+            "high": [110.0] * 9 + [110.0],
+            "low": [90.0] * 10,
+            "close": [100.0] * 9 + [100.1],
+            "volume": [100.0] * 10,
+        }, index=idx)
+        result = TrendConfirmation5M(cfg).check(df, idx[-1], "BTC/USDT:USDT", "long")
+        assert result.passed is False
+        assert len(result.conditions_passed) == 1
+
+    def test_ema9_slope_uses_i_vs_i_minus_2(self, cfg):
+        df = _trend_5m_df("long")
+        result = TrendConfirmation5M(cfg).check(df, df.index[-1], "BTC/USDT:USDT", "long")
+        ema9 = ind.ema(df["close"], cfg.trend_pullback.confirmation_5m.ema9_period)
+        assert result.metrics_snapshot["ema9_slope_ref"] == pytest.approx(float(ema9.iloc[-3]))
+
+    def test_confirmation_does_not_look_past_as_of(self, cfg):
+        df = _trend_5m_df("long")
+        future = df.iloc[-1:].copy()
+        future.index = [df.index[-1] + timedelta(minutes=5)]
+        future["close"] = 1000.0
+        with_future = pd.concat([df, future])
+        as_of = df.index[-2]
+        result = TrendConfirmation5M(cfg).check(with_future, as_of, "BTC/USDT:USDT", "long")
+        assert result.metrics_snapshot["close"] == pytest.approx(float(df.loc[as_of, "close"]))
+
+
+class TestSprint3RiskStopExecutor:
+    def test_risk_multiplier_half_reduces_risk(self, cfg):
+        plan = RiskEngine(cfg).build_plan(
+            symbol="BTC/USDT:USDT",
+            direction="long",
+            equity=5000.0,
+            entry_price=100.0,
+            stop_price=98.0,
+            risk_multiplier=0.5,
+        )
+        assert plan.risk_amount == pytest.approx(18.75)
+        assert plan.quantity == pytest.approx(9.375)
+
+    def test_max_total_open_risk_rejects(self, cfg):
+        plan = RiskEngine(cfg).build_plan(
+            symbol="BTC/USDT:USDT",
+            direction="long",
+            equity=5000.0,
+            entry_price=100.0,
+            stop_price=98.0,
+            current_open_risk_pct=0.01,
+        )
+        assert plan.approved is False
+        assert "EXCEEDS_MAX_TOTAL_OPEN_RISK" in plan.rejection_reasons
+
+    def test_stop_uses_pivot_when_available(self, cfg):
+        stop = TrendStopExitBuilder(cfg).build_stop_plan(
+            symbol="BTC/USDT:USDT",
+            direction="long",
+            entry_price=100.0,
+            atr_1h=1.0,
+            latest_pivot_low=98.0,
+        )
+        assert stop.stop_source == "pivot_low"
+        assert stop.stop_price == pytest.approx(97.8)
+
+    def test_stop_uses_atr_fallback_without_pivot(self, cfg):
+        stop = TrendStopExitBuilder(cfg).build_stop_plan(
+            symbol="BTC/USDT:USDT",
+            direction="short",
+            entry_price=100.0,
+            atr_1h=1.0,
+        )
+        assert stop.stop_source == "atr_fallback"
+        assert stop.stop_price == pytest.approx(101.8)
+
+    def test_exit_plan_prices_from_r(self, cfg):
+        assert cfg.trend_pullback.take_profit.tp2.tp2_r == pytest.approx(2.75)
+        exit_plan = TrendStopExitBuilder(cfg).build_exit_plan(
+            symbol="BTC/USDT:USDT",
+            direction="long",
+            entry_price=100.0,
+            stop_price=98.0,
+        )
+        assert exit_plan.tp1_price == pytest.approx(102.0)
+        assert exit_plan.tp1_fraction == pytest.approx(0.5)
+        assert exit_plan.tp2_price == pytest.approx(105.5)
+        assert exit_plan.tp2_fraction == pytest.approx(0.5)
+
+    def test_long_maker_limit_price(self, cfg):
+        price = TrendOrderIntentBuilder(cfg).compute_limit_price(
+            direction="long",
+            current_bid=100.0,
+            current_ask=100.1,
+            tick_size=0.01,
+            ema20_1h=100.0,
+            signal_5m_close=100.5,
+            atr_5m=1.0,
+        )
+        assert price == pytest.approx(99.99)
+
+    def test_short_maker_limit_price(self, cfg):
+        price = TrendOrderIntentBuilder(cfg).compute_limit_price(
+            direction="short",
+            current_bid=100.0,
+            current_ask=100.1,
+            tick_size=0.01,
+            ema20_1h=100.0,
+            signal_5m_close=99.5,
+            atr_5m=1.0,
+        )
+        assert price == pytest.approx(100.11)
+
+    def test_order_intent_expires_after_10_minutes(self, cfg):
+        ts = datetime(2026, 1, 1, 5, 45, tzinfo=timezone.utc)
+        intent = TrendOrderIntentBuilder(cfg).build_entry_intent(
+            symbol="BTC/USDT:USDT",
+            direction="long",
+            signal_timestamp=ts,
+            current_bid=100.0,
+            current_ask=100.1,
+            tick_size=0.01,
+            ema20_1h=100.0,
+            signal_5m_close=100.5,
+            atr_5m=1.0,
+            quantity=1.0,
+            signal_id="sig-1",
+        )
+        assert intent.expires_at == ts + timedelta(minutes=10)
+        assert intent.reduce_only is False
+
+
+class TestSprint3TrendStrategy:
+    def _long_1h(self):
+        idx = pd.date_range(datetime(2026, 1, 1, 0, tzinfo=timezone.utc), periods=6, freq="1h")
+        return pd.DataFrame({
+            "open": [100.0] * 6,
+            "high": [101.0] * 6,
+            "low": [99.8] * 6,
+            "close": [100.1] * 6,
+            "volume": [100.0] * 6,
+            "ema_20": [100.0] * 6,
+            "ema_50": [99.0] * 6,
+            "rsi_14": [45.0, 47.0, 49.0, 48.0, 49.0, 51.0],
+            "atr_14": [1.0] * 6,
+        }, index=idx)
+
+    def _short_1h(self):
+        idx = pd.date_range(datetime(2026, 1, 1, 0, tzinfo=timezone.utc), periods=6, freq="1h")
+        return pd.DataFrame({
+            "open": [100.0] * 6,
+            "high": [100.2] * 6,
+            "low": [99.0] * 6,
+            "close": [99.9] * 6,
+            "volume": [100.0] * 6,
+            "ema_20": [100.0] * 6,
+            "ema_50": [101.0] * 6,
+            "rsi_14": [55.0, 57.0, 54.0, 52.0, 51.0, 49.0],
+            "atr_14": [1.0] * 6,
+        }, index=idx)
+
+    def test_regime_a_long_full_stack_approves_signal(self, cfg):
+        as_of = datetime(2026, 1, 1, 5, 45, tzinfo=timezone.utc)
+        result = TrendPullbackStrategy(cfg).evaluate(
+            symbol="BTC/USDT:USDT",
+            as_of=as_of,
+            regime_state=_manual_regime_state(direction="long"),
+            df_1h=self._long_1h(),
+            df_5m=_trend_5m_df("long"),
+            equity=5000.0,
+            current_bid=100.0,
+            current_ask=100.1,
+            tick_size=0.01,
+        )
+        assert result.approved is True
+        assert result.entry_order_intent is not None
+        assert result.risk_plan is not None
+        assert result.stop_plan is not None
+        assert result.exit_plan is not None
+
+    def test_regime_a_short_full_stack_approves_signal(self, cfg):
+        as_of = datetime(2026, 1, 1, 5, 45, tzinfo=timezone.utc)
+        result = TrendPullbackStrategy(cfg).evaluate(
+            symbol="BTC/USDT:USDT",
+            as_of=as_of,
+            regime_state=_manual_regime_state(direction="short"),
+            df_1h=self._short_1h(),
+            df_5m=_trend_5m_df("short"),
+            equity=5000.0,
+            current_bid=100.0,
+            current_ask=100.1,
+            tick_size=0.01,
+        )
+        assert result.approved is True
+        assert result.direction == "short"
+
+    @pytest.mark.parametrize("regime", [Regime.UNKNOWN, Regime.B_SIDEWAYS, Regime.D_NO_TRADE])
+    def test_non_a_regimes_reject(self, cfg, regime):
+        result = TrendPullbackStrategy(cfg).evaluate(
+            symbol="BTC/USDT:USDT",
+            as_of=datetime(2026, 1, 1, 5, 45, tzinfo=timezone.utc),
+            regime_state=_manual_regime_state(regime=regime, direction="long"),
+            df_1h=self._long_1h(),
+            df_5m=_trend_5m_df("long"),
+            equity=5000.0,
+            current_bid=100.0,
+            current_ask=100.1,
+            tick_size=0.01,
+        )
+        assert result.approved is False
+        assert "REGIME_NOT_A" in result.rejection_reasons
+
+    def test_funding_overheated_rejects_long(self, cfg):
+        result = TrendPullbackStrategy(cfg).evaluate(
+            symbol="BTC/USDT:USDT",
+            as_of=datetime(2026, 1, 1, 5, 45, tzinfo=timezone.utc),
+            regime_state=_manual_regime_state(direction="long", funding_z=2.1),
+            df_1h=self._long_1h(),
+            df_5m=_trend_5m_df("long"),
+            equity=5000.0,
+            current_bid=100.0,
+            current_ask=100.1,
+            tick_size=0.01,
+        )
+        assert result.approved is False
+        assert "FUNDING_OVERHEATED_LONG" in result.rejection_reasons
+
+    def test_extreme_vol_rejects(self, cfg):
+        result = TrendPullbackStrategy(cfg).evaluate(
+            symbol="BTC/USDT:USDT",
+            as_of=datetime(2026, 1, 1, 5, 45, tzinfo=timezone.utc),
+            regime_state=_manual_regime_state(direction="long", extreme_vol=True),
+            df_1h=self._long_1h(),
+            df_5m=_trend_5m_df("long"),
+            equity=5000.0,
+            current_bid=100.0,
+            current_ask=100.1,
+            tick_size=0.01,
+        )
+        assert result.approved is False
+        assert "EXTREME_VOL" in result.rejection_reasons
+
+    def test_allow_new_entries_false_rejects(self, cfg):
+        result = TrendPullbackStrategy(cfg).evaluate(
+            symbol="BTC/USDT:USDT",
+            as_of=datetime(2026, 1, 1, 5, 45, tzinfo=timezone.utc),
+            regime_state=_manual_regime_state(direction="long", allow_new_entries=False),
+            df_1h=self._long_1h(),
+            df_5m=_trend_5m_df("long"),
+            equity=5000.0,
+            current_bid=100.0,
+            current_ask=100.1,
+            tick_size=0.01,
+        )
+        assert result.approved is False
+        assert "ALLOW_NEW_ENTRIES_FALSE" in result.rejection_reasons
+
+
+class TestSprint3Regression:
+    def test_executor_only_creates_order_intent(self):
+        from pathlib import Path
+        src = Path(__file__).resolve().parents[1] / "strategies" / "r3" / "executor.py"
+        text = src.read_text(encoding="utf-8")
+        for forbidden in ["create_order", "submit_order", "cancel_order", "ccxt"]:
+            assert forbidden not in text
+
+    def test_trend_strategy_does_not_import_backtest_or_other_strategies(self):
+        from pathlib import Path
+        src = Path(__file__).resolve().parents[1] / "strategies" / "r3" / "trend_pullback.py"
+        text = src.read_text(encoding="utf-8")
+        for forbidden in ["BacktestEngine", "from .mean_reversion", "from .funding_reversal", "position_manager"]:
+            assert forbidden not in text
+
 
 UTC = timezone.utc
 
