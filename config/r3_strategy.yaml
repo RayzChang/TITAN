@@ -51,6 +51,7 @@ regime:
     price_band_atr_4h_mult: 0.5
     bb_width_percentile_low: 10
     bb_width_percentile_high: 50
+    bb_width_percentile_lookback_days: 90   # Spec §3.2 「近 90 天」
     funding_z_abs_max: 1.0
 
   # ----- C 極端擁擠 -----

@@ -547,6 +547,42 @@ def shooting_star(
 
 
 # =============================================================================
+# 13. Helpers used by Regime classifier (Sprint 2)
+# =============================================================================
+def rolling_percentile_rank(s: pd.Series, window: int) -> pd.Series:
+    """
+    Rolling percentile rank（0~100）of current value within trailing `window` bars.
+
+    用於 §3.2 「BB_width 處於近 90 天 10–50 分位」的判定。
+    使用 `min_periods=window` → 暖機期回 NaN，不產生假分位。
+    """
+    if window <= 0:
+        raise ValueError("window must be positive")
+    return s.rolling(window=window, min_periods=window).rank(pct=True) * 100
+
+
+def consecutive_large_candles_count(
+    high: pd.Series,
+    low: pd.Series,
+    atr_series: pd.Series,
+    multiplier: float,
+    n_recent: int,
+) -> pd.Series:
+    """
+    回傳「最近 `n_recent` 根 K 中，振幅 (high-low) > multiplier × ATR 的根數」。
+
+    用於 §3.4 D1 「連續 `n_recent` 根 K 線振幅過大」判定。
+    若 == n_recent → 觸發 D1。
+    """
+    if n_recent <= 0:
+        raise ValueError("n_recent must be positive")
+    candle_range = high - low
+    threshold = multiplier * atr_series
+    is_large = (candle_range > threshold).astype(int)
+    return is_large.rolling(window=n_recent, min_periods=n_recent).sum()
+
+
+# =============================================================================
 # Convenience: build a full indicator DF from config + ohlcv
 # =============================================================================
 def attach_core_indicators(
@@ -577,6 +613,10 @@ def attach_core_indicators(
         out[f"ema_{tfi.ema_long_period}"] = ema(out["close"], tfi.ema_long_period)
         out[f"adx_{tfi.adx_period}"] = adx(
             out["high"], out["low"], out["close"], tfi.adx_period,
+        )
+        # ATR_4H — Regime B 「價格在 EMA200 ± price_band_atr_4h_mult × ATR_4H」用
+        out[f"atr_{atr_period}"] = atr(
+            out["high"], out["low"], out["close"], atr_period,
         )
 
     elif timeframe == "1h":
