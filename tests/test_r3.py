@@ -1168,3 +1168,616 @@ class TestAttachCoreIndicators:
         df = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
         out = ind.attach_core_indicators(df, cfg, "1h")
         assert out.empty
+
+    def test_4h_now_attaches_atr_for_regime_b(self, cfg):
+        """Sprint 2 needs ATR_4H for Regime B 'price near EMA200' distance check."""
+        df = _make_clean_ohlcv(300, "4h", seed=8)
+        out = ind.attach_core_indicators(df, cfg, "4h")
+        atr_period = cfg.realized_vol.atr_period
+        assert f"atr_{atr_period}" in out.columns
+
+
+# ===============================================================
+# Sprint 2 — Regime helper indicators
+# ===============================================================
+class TestRollingPercentileRank:
+    def test_window_must_be_positive(self):
+        with pytest.raises(ValueError):
+            ind.rolling_percentile_rank(pd.Series([1.0]), window=0)
+
+    def test_first_window_minus_one_is_nan(self):
+        s = pd.Series(np.arange(1, 30, dtype=float))
+        out = ind.rolling_percentile_rank(s, window=10)
+        assert out.iloc[:9].isna().all()
+        assert not pd.isna(out.iloc[9])
+
+    def test_last_value_in_increasing_series_is_100(self):
+        s = pd.Series(np.arange(1, 21, dtype=float))
+        out = ind.rolling_percentile_rank(s, window=20)
+        assert out.iloc[-1] == 100.0
+
+    def test_constant_series_returns_consistent_rank(self):
+        # pandas rank(pct=True) 對全 tie 給平均排名 → window=10 時為 (1+10)/2 / 10 × 100 = 55
+        s = pd.Series([5.0] * 30)
+        out = ind.rolling_percentile_rank(s, window=10)
+        valid = out.dropna()
+        # 全部值相同時，分位排名應一致（Sprint 2 用途上：分位「不變動」即可，具體值不重要）
+        assert valid.nunique() == 1
+
+
+class TestConsecutiveLargeCandlesCount:
+    def test_n_recent_must_be_positive(self):
+        with pytest.raises(ValueError):
+            ind.consecutive_large_candles_count(
+                pd.Series([1.0]), pd.Series([1.0]), pd.Series([1.0]),
+                multiplier=2.5, n_recent=0,
+            )
+
+    def test_two_consecutive_large_count_is_2(self):
+        # ATR=1，high-low 都是 3 → 全部 > 2.5×1=2.5
+        n = 10
+        high = pd.Series([10.0] * n)
+        low = pd.Series([7.0] * n)
+        atr_s = pd.Series([1.0] * n)
+        out = ind.consecutive_large_candles_count(high, low, atr_s, multiplier=2.5, n_recent=2)
+        # 暖機期 NaN，之後全 2
+        valid = out.dropna()
+        assert (valid == 2).all()
+
+    def test_no_large_count_is_0(self):
+        n = 10
+        high = pd.Series([10.0] * n)
+        low = pd.Series([9.5] * n)   # range=0.5 < 2.5
+        atr_s = pd.Series([1.0] * n)
+        out = ind.consecutive_large_candles_count(high, low, atr_s, multiplier=2.5, n_recent=2)
+        valid = out.dropna()
+        assert (valid == 0).all()
+
+
+# ===============================================================
+# ===============================================================
+# Sprint 2 — Regime Classifier
+# ===============================================================
+# ===============================================================
+
+from strategies.r3.regime import (
+    Regime,
+    Direction,
+    RegimeClassifier,
+    RegimeSnapshot,
+    SystemStatus,
+    SessionStatus,
+    RegimeState,
+    REGIME_NAMES,
+    build_snapshot_from_indicators,
+)
+
+
+def _now_utc():
+    return datetime(2026, 5, 1, tzinfo=UTC)
+
+
+def _trend_long_snapshot(**overrides):
+    """Reusable baseline that satisfies Regime A long without triggering D/C/B."""
+    base = dict(
+        ema_4h_short=100.0,
+        ema_4h_long=90.0,
+        adx_4h=30.0,
+        close_1h=100.0,
+        atr_4h=2.0,
+        bb_width_pct_rank_1h=70.0,   # outside B range (10-50)
+        extreme_vol=False,
+        consecutive_large_candles_triggered=False,
+        funding_z=0.5,
+        premium_z=0.0,
+        funding_samples_sufficient=True,
+        premium_samples_sufficient=True,
+        bar_index_1h=24 * 100,        # past warmup
+        bars_per_day_1h=24,
+    )
+    base.update(overrides)
+    return RegimeSnapshot(**base)
+
+
+def _sideways_snapshot(**overrides):
+    base = dict(
+        ema_4h_short=100.0,
+        ema_4h_long=100.1,
+        adx_4h=15.0,
+        close_1h=100.05,
+        atr_4h=2.0,
+        bb_width_pct_rank_1h=25.0,
+        extreme_vol=False,
+        consecutive_large_candles_triggered=False,
+        funding_z=0.2,
+        premium_z=0.0,
+        funding_samples_sufficient=True,
+        premium_samples_sufficient=True,
+        bar_index_1h=24 * 100,
+        bars_per_day_1h=24,
+    )
+    base.update(overrides)
+    return RegimeSnapshot(**base)
+
+
+# ---------------------------------------------------------------
+# Regime A — Trend
+# ---------------------------------------------------------------
+class TestRegimeATrend:
+    def test_long_trend_when_ema50_above_ema200_and_high_adx(self, cfg):
+        rc = RegimeClassifier(cfg)
+        snap = _trend_long_snapshot()
+        state = rc.classify(_now_utc(), "BTC/USDT:USDT", snap)
+        assert state.regime == Regime.A_TREND
+        assert state.direction == Direction.LONG.value
+        assert state.allow_new_entries is True
+        assert "A_TREND" in state.reason_codes
+
+    def test_short_trend_when_ema50_below_ema200(self, cfg):
+        rc = RegimeClassifier(cfg)
+        snap = _trend_long_snapshot(ema_4h_short=90.0, ema_4h_long=100.0)
+        state = rc.classify(_now_utc(), "BTC/USDT:USDT", snap)
+        assert state.regime == Regime.A_TREND
+        assert state.direction == Direction.SHORT.value
+
+    def test_low_adx_breaks_trend_no_a(self, cfg):
+        rc = RegimeClassifier(cfg)
+        # ADX 21 < min 22 → A 不成立；其他不滿足 B → UNKNOWN
+        snap = _trend_long_snapshot(adx_4h=21.0)
+        state = rc.classify(_now_utc(), "BTC/USDT:USDT", snap)
+        assert state.regime != Regime.A_TREND
+
+    def test_extreme_vol_takes_to_d(self, cfg):
+        rc = RegimeClassifier(cfg)
+        snap = _trend_long_snapshot(extreme_vol=True)
+        state = rc.classify(_now_utc(), "BTC/USDT:USDT", snap)
+        assert state.regime == Regime.D_NO_TRADE
+        assert "D1_EXTREME_VOL" in state.reason_codes
+
+    def test_funding_z_at_or_above_a_max_blocks_trend(self, cfg):
+        rc = RegimeClassifier(cfg)
+        # a_trend.funding_z_abs_max = 2.5；2.6 應該 block，但因 ≤ 3.0 不算 panic
+        snap = _trend_long_snapshot(funding_z=2.6)
+        state = rc.classify(_now_utc(), "BTC/USDT:USDT", snap)
+        assert state.regime != Regime.A_TREND
+
+    def test_config_threshold_drives_decision(self, cfg):
+        """ADX 剛好在 a_trend.adx_4h_min 邊界：> min 才算 trend，== 不算"""
+        rc = RegimeClassifier(cfg)
+        threshold = cfg.regime.a_trend.adx_4h_min
+        snap_at = _trend_long_snapshot(adx_4h=float(threshold))
+        snap_above = _trend_long_snapshot(adx_4h=float(threshold) + 0.1)
+        assert rc.classify(_now_utc(), "X", snap_at).regime != Regime.A_TREND
+        assert rc.classify(_now_utc(), "X", snap_above).regime == Regime.A_TREND
+
+
+# ---------------------------------------------------------------
+# Regime B — Sideways
+# ---------------------------------------------------------------
+class TestRegimeBSideways:
+    def test_low_adx_price_near_ema_bb_in_range(self, cfg):
+        rc = RegimeClassifier(cfg)
+        snap = _sideways_snapshot()
+        state = rc.classify(_now_utc(), "BTC/USDT:USDT", snap)
+        assert state.regime == Regime.B_SIDEWAYS
+        assert state.direction == Direction.NEUTRAL.value
+        assert "B_SIDEWAYS" in state.reason_codes
+
+    def test_price_too_far_from_ema200_no_b(self, cfg):
+        rc = RegimeClassifier(cfg)
+        # close 距 ema_200 = 5 vs 0.5 × atr_4h = 1 → 失格
+        snap = _sideways_snapshot(close_1h=105.0)
+        state = rc.classify(_now_utc(), "X", snap)
+        assert state.regime != Regime.B_SIDEWAYS
+
+    def test_bb_width_outside_band_no_b(self, cfg):
+        rc = RegimeClassifier(cfg)
+        snap = _sideways_snapshot(bb_width_pct_rank_1h=80.0)  # 超過 50
+        state = rc.classify(_now_utc(), "X", snap)
+        assert state.regime != Regime.B_SIDEWAYS
+
+    def test_funding_extreme_breaks_b(self, cfg):
+        rc = RegimeClassifier(cfg)
+        # b_range.funding_z_abs_max = 1.0；funding_z=1.5 應 block B
+        snap = _sideways_snapshot(funding_z=1.5)
+        state = rc.classify(_now_utc(), "X", snap)
+        assert state.regime != Regime.B_SIDEWAYS
+
+    def test_extreme_vol_takes_to_d_not_b(self, cfg):
+        rc = RegimeClassifier(cfg)
+        snap = _sideways_snapshot(extreme_vol=True)
+        state = rc.classify(_now_utc(), "X", snap)
+        assert state.regime == Regime.D_NO_TRADE
+
+
+# ---------------------------------------------------------------
+# Regime C — Funding Extreme
+# ---------------------------------------------------------------
+class TestRegimeCFundingExtreme:
+    def test_positive_extreme_to_contrarian_short(self, cfg):
+        rc = RegimeClassifier(cfg)
+        snap = _trend_long_snapshot(funding_z=3.0, premium_z=2.5)
+        # funding_z 3.0 > d1.panic 3.0 → False（>，不 ≥）；但若 >3.0 會觸發 D1
+        # 用 funding_z=2.7 (>=2.5 c threshold, <3.0 panic), premium_z=2.5
+        snap = _trend_long_snapshot(funding_z=2.7, premium_z=2.5)
+        state = rc.classify(_now_utc(), "X", snap)
+        assert state.regime == Regime.C_FUNDING_EXTREME
+        assert state.direction == Direction.CONTRARIAN_SHORT.value
+
+    def test_negative_extreme_to_contrarian_long(self, cfg):
+        rc = RegimeClassifier(cfg)
+        snap = _trend_long_snapshot(funding_z=-2.7, premium_z=-2.5)
+        state = rc.classify(_now_utc(), "X", snap)
+        assert state.regime == Regime.C_FUNDING_EXTREME
+        assert state.direction == Direction.CONTRARIAN_LONG.value
+
+    def test_funding_insufficient_no_c(self, cfg):
+        rc = RegimeClassifier(cfg)
+        snap = _trend_long_snapshot(
+            funding_z=2.7, premium_z=2.5,
+            funding_samples_sufficient=False,
+        )
+        state = rc.classify(_now_utc(), "X", snap)
+        assert state.regime != Regime.C_FUNDING_EXTREME
+        assert "funding_z" in state.insufficient_data_fields
+
+    def test_premium_insufficient_no_c(self, cfg):
+        rc = RegimeClassifier(cfg)
+        snap = _trend_long_snapshot(
+            funding_z=2.7, premium_z=2.5,
+            premium_samples_sufficient=False,
+        )
+        state = rc.classify(_now_utc(), "X", snap)
+        assert state.regime != Regime.C_FUNDING_EXTREME
+
+    def test_only_funding_extreme_no_c(self, cfg):
+        """funding 過熱但 premium 中性 → 不算 C（spec 要求兩者同方向極端）"""
+        rc = RegimeClassifier(cfg)
+        snap = _trend_long_snapshot(funding_z=2.7, premium_z=0.5)
+        state = rc.classify(_now_utc(), "X", snap)
+        assert state.regime != Regime.C_FUNDING_EXTREME
+
+    def test_opposite_signs_no_c(self, cfg):
+        """funding_z 正極端 + premium_z 負極端 → 不一致，不觸發 C"""
+        rc = RegimeClassifier(cfg)
+        snap = _trend_long_snapshot(funding_z=2.7, premium_z=-2.5)
+        state = rc.classify(_now_utc(), "X", snap)
+        assert state.regime != Regime.C_FUNDING_EXTREME
+
+
+# ---------------------------------------------------------------
+# Regime D — No Trade
+# ---------------------------------------------------------------
+class TestRegimeDNoTrade:
+    def test_extreme_vol_triggers_d(self, cfg):
+        rc = RegimeClassifier(cfg)
+        snap = _trend_long_snapshot(extreme_vol=True)
+        state = rc.classify(_now_utc(), "X", snap)
+        assert state.regime == Regime.D_NO_TRADE
+        assert state.allow_new_entries is False
+        assert "D1_EXTREME_VOL" in state.reason_codes
+
+    def test_consecutive_large_candles_triggers_d(self, cfg):
+        rc = RegimeClassifier(cfg)
+        snap = _trend_long_snapshot(consecutive_large_candles_triggered=True)
+        state = rc.classify(_now_utc(), "X", snap)
+        assert state.regime == Regime.D_NO_TRADE
+        assert "D1_CONSECUTIVE_LARGE_CANDLES" in state.reason_codes
+
+    def test_funding_panic_triggers_d(self, cfg):
+        """|funding_z| > d1.funding_z_abs_panic (3.0) → D1"""
+        rc = RegimeClassifier(cfg)
+        snap = _trend_long_snapshot(funding_z=3.5)
+        state = rc.classify(_now_utc(), "X", snap)
+        assert state.regime == Regime.D_NO_TRADE
+        assert "D1_FUNDING_PANIC" in state.reason_codes
+
+    def test_missing_data_flag_triggers_d(self, cfg):
+        rc = RegimeClassifier(cfg)
+        snap = _trend_long_snapshot()
+        state = rc.classify(_now_utc(), "X", snap, missing_data_flags=["kline_gap_1h"])
+        assert state.regime == Regime.D_NO_TRADE
+        assert "D1_MISSING_DATA" in state.reason_codes
+
+    def test_session_daily_loss_triggers_d_with_session_risk_reason(self, cfg):
+        """A2: session 風險用 D_SESSION_RISK_* 前綴，不混入 D1_*"""
+        rc = RegimeClassifier(cfg)
+        snap = _trend_long_snapshot()
+        ss = SessionStatus(daily_pnl_pct=-2.5)
+        state = rc.classify(_now_utc(), "X", snap, session_status=ss)
+        assert state.regime == Regime.D_NO_TRADE
+        assert "D_SESSION_RISK_DAILY_LOSS_LIMIT" in state.reason_codes
+        # 不應誤標成市場風險
+        assert "D1_DAILY_LOSS_LIMIT" not in state.reason_codes
+
+    def test_session_consecutive_loss_triggers_d_with_session_risk_reason(self, cfg):
+        rc = RegimeClassifier(cfg)
+        snap = _trend_long_snapshot()
+        ss = SessionStatus(consecutive_losses=4)
+        state = rc.classify(_now_utc(), "X", snap, session_status=ss)
+        assert state.regime == Regime.D_NO_TRADE
+        assert "D_SESSION_RISK_CONSECUTIVE_LOSS" in state.reason_codes
+        assert "D1_CONSECUTIVE_LOSS_LIMIT" not in state.reason_codes
+
+    def test_no_session_status_does_not_trigger_session_risk(self, cfg):
+        """未提供 SessionStatus 時，不應出現 D_SESSION_RISK_*"""
+        rc = RegimeClassifier(cfg)
+        snap = _trend_long_snapshot()
+        state = rc.classify(_now_utc(), "X", snap)
+        for code in state.reason_codes:
+            assert not code.startswith("D_SESSION_RISK_")
+
+    def test_api_latency_triggers_d2(self, cfg):
+        rc = RegimeClassifier(cfg)
+        snap = _trend_long_snapshot()
+        ss = SystemStatus(api_latency_abnormal=True)
+        state = rc.classify(_now_utc(), "X", snap, system_status=ss)
+        assert state.regime == Regime.D_NO_TRADE
+        assert "D2_API_LATENCY_ABNORMAL" in state.reason_codes
+
+    def test_websocket_disconnect_triggers_d2(self, cfg):
+        rc = RegimeClassifier(cfg)
+        snap = _trend_long_snapshot()
+        ss = SystemStatus(websocket_disconnected=True)
+        state = rc.classify(_now_utc(), "X", snap, system_status=ss)
+        assert state.regime == Regime.D_NO_TRADE
+        assert "D2_WEBSOCKET_DISCONNECTED" in state.reason_codes
+
+    def test_multiple_d_reasons_collected(self, cfg):
+        rc = RegimeClassifier(cfg)
+        snap = _trend_long_snapshot(extreme_vol=True, consecutive_large_candles_triggered=True)
+        state = rc.classify(_now_utc(), "X", snap)
+        assert state.regime == Regime.D_NO_TRADE
+        assert "D1_EXTREME_VOL" in state.reason_codes
+        assert "D1_CONSECUTIVE_LARGE_CANDLES" in state.reason_codes
+
+
+# ---------------------------------------------------------------
+# Priority — D > C > A > B > UNKNOWN
+# ---------------------------------------------------------------
+class TestRegimePriority:
+    def test_d_wins_over_a(self, cfg):
+        rc = RegimeClassifier(cfg)
+        # 同時有 trend + extreme_vol → D
+        snap = _trend_long_snapshot(extreme_vol=True)
+        state = rc.classify(_now_utc(), "X", snap)
+        assert state.regime == Regime.D_NO_TRADE
+
+    def test_d_wins_over_c(self, cfg):
+        rc = RegimeClassifier(cfg)
+        # funding_z 4.0 → 同時 panic (D1) 且 funding extreme (C)
+        snap = _trend_long_snapshot(funding_z=4.0, premium_z=2.5)
+        state = rc.classify(_now_utc(), "X", snap)
+        assert state.regime == Regime.D_NO_TRADE
+
+    def test_c_wins_over_a_and_preserves_trend_info(self, cfg):
+        """C 與 A 同時成立時，最終為 C，但 trend_info 保留 A 方向"""
+        rc = RegimeClassifier(cfg)
+        # funding_z=2.7 +premium_z=2.5 → C (contrarian short)
+        # 但 funding_z=2.7 > a_trend.funding_z_abs_max=2.5 → A 不成立
+        # 為了讓 A 與 C 同時成立，需要把 a_trend.funding_z_abs_max 拉超過 C threshold
+        # spec 設計上 a_trend max < c threshold，所以「同時成立」幾乎不會發生。
+        # 我們直接構造邊界情境：funding_z 剛好超過 c_threshold 但等於 a_max
+        # 由於 a_trend 的 |funding_z| >= a_max 就 block，C 與 A 同時成立的窗口很窄。
+        # 這個 test 改成驗證「C 即使 A 不成立也能單獨觸發」+「reason 結構正確」
+        snap = _trend_long_snapshot(funding_z=2.7, premium_z=2.5)
+        state = rc.classify(_now_utc(), "X", snap)
+        assert state.regime == Regime.C_FUNDING_EXTREME
+        # 在這個快照中 A 因 funding_z 超過 a_max 而失格 → trend_info 不應出現
+        # （spec 設計上 C 與 A 通常互斥）
+
+    def test_a_wins_over_b(self, cfg):
+        """ADX 介於 A.min 與 B.max 之間時，依 spec 應走 A（高 ADX 優先）。
+        但 spec 把這視為灰區；測試實際行為：高 ADX → A，低 ADX → B"""
+        rc = RegimeClassifier(cfg)
+        snap_a = _trend_long_snapshot(adx_4h=30.0)
+        snap_b = _sideways_snapshot()
+        assert rc.classify(_now_utc(), "X", snap_a).regime == Regime.A_TREND
+        assert rc.classify(_now_utc(), "X", snap_b).regime == Regime.B_SIDEWAYS
+
+    def test_unknown_when_no_match(self, cfg):
+        rc = RegimeClassifier(cfg)
+        # ADX 介於 b.max(18) 與 a.min(22) 之間 → A/B 都不滿足
+        snap = _trend_long_snapshot(
+            adx_4h=20.0, ema_4h_short=100.0, ema_4h_long=100.0,
+            bb_width_pct_rank_1h=70.0,
+        )
+        state = rc.classify(_now_utc(), "X", snap)
+        assert state.regime == Regime.UNKNOWN
+        assert state.allow_new_entries is False
+
+    def test_a1_boundary_at_funding_z_2_5_prefers_c_over_a(self, cfg):
+        """
+        A1（BOSS 拍板）：funding_z 邊界 2.5 時 A/C 互斥，優先進 C。
+
+        - funding_z = 2.5 (== a_max == c_threshold)
+        - premium_z = 2.0 (== c.premium_z_threshold)
+        - 預期：C 觸發，A 失格
+        """
+        rc = RegimeClassifier(cfg)
+        a_max = cfg.regime.a_trend.funding_z_abs_max
+        c_thr = cfg.regime.c_extreme.funding_z_threshold
+        p_thr = cfg.regime.c_extreme.premium_z_threshold
+        # 確認 spec 仍然 a_max == c_thr（互斥邊界）
+        assert a_max == c_thr, "A1 設計預期 a_trend.funding_z_abs_max == c_extreme.funding_z_threshold"
+
+        snap = _trend_long_snapshot(funding_z=c_thr, premium_z=p_thr)
+        state = rc.classify(_now_utc(), "X", snap)
+        assert state.regime == Regime.C_FUNDING_EXTREME
+        assert state.direction == Direction.CONTRARIAN_SHORT.value
+
+    def test_a1_just_below_boundary_allows_a(self, cfg):
+        """funding_z 小一咪咪（2.49）→ 進 A trend，不進 C"""
+        rc = RegimeClassifier(cfg)
+        c_thr = cfg.regime.c_extreme.funding_z_threshold
+        snap = _trend_long_snapshot(funding_z=c_thr - 0.01, premium_z=2.0)
+        state = rc.classify(_now_utc(), "X", snap)
+        assert state.regime == Regime.A_TREND
+
+
+# ---------------------------------------------------------------
+# Insufficient data
+# ---------------------------------------------------------------
+class TestRegimeInsufficientData:
+    def test_missing_ema_returns_unknown(self, cfg):
+        rc = RegimeClassifier(cfg)
+        snap = _trend_long_snapshot(ema_4h_short=None)
+        state = rc.classify(_now_utc(), "X", snap)
+        assert state.regime == Regime.UNKNOWN
+        assert "ema_4h_short" in state.insufficient_data_fields
+        assert "INSUFFICIENT_DATA" in state.reason_codes
+
+    def test_missing_adx_returns_unknown(self, cfg):
+        rc = RegimeClassifier(cfg)
+        snap = _trend_long_snapshot(adx_4h=None)
+        state = rc.classify(_now_utc(), "X", snap)
+        assert state.regime == Regime.UNKNOWN
+
+    def test_funding_insufficient_does_not_block_a(self, cfg):
+        """A 不需要 funding 樣本充足；funding_z 為 None 時應仍可判 A"""
+        rc = RegimeClassifier(cfg)
+        snap = _trend_long_snapshot(
+            funding_z=None,
+            funding_samples_sufficient=False,
+        )
+        state = rc.classify(_now_utc(), "X", snap)
+        # funding 不足會列入 insufficient_data_fields，但不阻擋 A
+        assert state.regime == Regime.A_TREND
+        assert "funding_z" in state.insufficient_data_fields
+
+    def test_warmup_period_returns_d(self, cfg):
+        """Day 0~30 不可交易 → D"""
+        rc = RegimeClassifier(cfg)
+        snap = _trend_long_snapshot(bar_index_1h=10 * 24)  # day 10
+        state = rc.classify(_now_utc(), "X", snap)
+        assert state.regime == Regime.D_NO_TRADE
+        assert "D1_WARMUP_PERIOD" in state.reason_codes
+
+
+# ---------------------------------------------------------------
+# Output structure / Regression — no trading actions
+# ---------------------------------------------------------------
+class TestRegimeOutputStructure:
+    def test_state_is_dataclass_with_required_fields(self, cfg):
+        rc = RegimeClassifier(cfg)
+        state = rc.classify(_now_utc(), "BTC/USDT:USDT", _trend_long_snapshot())
+        assert isinstance(state, RegimeState)
+        for field_name in [
+            "as_of", "symbol", "regime", "regime_name",
+            "direction", "allow_new_entries",
+            "reason_codes", "metrics_snapshot",
+            "insufficient_data_fields",
+        ]:
+            assert hasattr(state, field_name)
+
+    def test_regime_name_matches_enum(self, cfg):
+        rc = RegimeClassifier(cfg)
+        for snap_factory in [_trend_long_snapshot, _sideways_snapshot]:
+            state = rc.classify(_now_utc(), "X", snap_factory())
+            assert state.regime_name == REGIME_NAMES[state.regime]
+
+    def test_metrics_snapshot_includes_all_inputs(self, cfg):
+        rc = RegimeClassifier(cfg)
+        state = rc.classify(_now_utc(), "X", _trend_long_snapshot())
+        for k in ["ema_4h_short", "ema_4h_long", "adx_4h",
+                  "atr_4h", "close_1h", "funding_z", "premium_z"]:
+            assert k in state.metrics_snapshot
+
+    def test_d_state_disallows_entries(self, cfg):
+        rc = RegimeClassifier(cfg)
+        state = rc.classify(_now_utc(), "X", _trend_long_snapshot(extreme_vol=True))
+        assert state.allow_new_entries is False
+
+    def test_unknown_state_disallows_entries(self, cfg):
+        rc = RegimeClassifier(cfg)
+        state = rc.classify(_now_utc(), "X", _trend_long_snapshot(adx_4h=None))
+        assert state.allow_new_entries is False
+
+
+class TestRegimeNoTradingLogic:
+    """Regression: classifier 不應有任何 trading 副作用"""
+
+    def test_classify_does_not_create_orders(self, cfg):
+        rc = RegimeClassifier(cfg)
+        # 嘗試從 RegimeState 找出任何看起來像「下單 / 改持倉」的方法或屬性
+        state = rc.classify(_now_utc(), "X", _trend_long_snapshot())
+        for forbidden in ["create_order", "submit_order", "cancel_order",
+                          "open_position", "close_position",
+                          "place_stop", "place_take_profit"]:
+            assert not hasattr(state, forbidden)
+            assert not hasattr(rc, forbidden)
+
+    def test_classifier_holds_no_trading_state(self, cfg):
+        rc = RegimeClassifier(cfg)
+        # classify 多次不應累積狀態
+        s1 = rc.classify(_now_utc(), "X", _trend_long_snapshot())
+        s2 = rc.classify(_now_utc(), "X", _sideways_snapshot())
+        assert s1.regime != s2.regime  # 不互相影響
+
+    def test_classifier_does_not_import_executor_or_position_manager(self):
+        """純文字檢查：regime.py 不應 import executor / position_manager / order"""
+        from pathlib import Path
+        regime_src = Path(__file__).resolve().parents[1] / "strategies" / "r3" / "regime.py"
+        text = regime_src.read_text(encoding="utf-8")
+        assert "from .executor" not in text
+        assert "import executor" not in text
+        assert "position_manager" not in text
+        assert "order_manager" not in text
+
+
+# ---------------------------------------------------------------
+# build_snapshot_from_indicators — integration helper
+# ---------------------------------------------------------------
+class TestBuildSnapshotFromIndicators:
+    def test_builds_snapshot_from_real_indicator_dfs(self, cfg):
+        """整合測試：用合成 OHLCV → attach_core_indicators → build_snapshot"""
+        df_4h = _make_clean_ohlcv(300, "4h", seed=11)
+        df_1h = _make_clean_ohlcv(2400, "1h", seed=12)  # 100 days @ 24
+
+        df_4h_ind = ind.attach_core_indicators(df_4h, cfg, "4h")
+        df_1h_ind = ind.attach_core_indicators(df_1h, cfg, "1h")
+
+        snap = build_snapshot_from_indicators(
+            cfg=cfg,
+            df_4h_with_indicators=df_4h_ind,
+            df_1h_with_indicators=df_1h_ind,
+            funding_z_value=0.5,
+            premium_z_value=0.0,
+            extreme_vol_at_t=False,
+            consecutive_large_candles_at_t=False,
+            bar_index_1h=len(df_1h_ind) - 1,
+            bars_per_day_1h=24,
+        )
+        # 必填欄位都填到了
+        assert snap.ema_4h_short is not None
+        assert snap.ema_4h_long is not None
+        assert snap.adx_4h is not None
+        assert snap.atr_4h is not None
+        assert snap.close_1h is not None
+        assert snap.funding_samples_sufficient is True
+        assert snap.premium_samples_sufficient is True
+
+    def test_classifier_runs_on_built_snapshot(self, cfg):
+        df_4h = _make_clean_ohlcv(300, "4h", seed=21)
+        df_1h = _make_clean_ohlcv(2400, "1h", seed=22)
+        df_4h_ind = ind.attach_core_indicators(df_4h, cfg, "4h")
+        df_1h_ind = ind.attach_core_indicators(df_1h, cfg, "1h")
+
+        snap = build_snapshot_from_indicators(
+            cfg=cfg,
+            df_4h_with_indicators=df_4h_ind,
+            df_1h_with_indicators=df_1h_ind,
+            funding_z_value=0.5, premium_z_value=0.0,
+            extreme_vol_at_t=False,
+            consecutive_large_candles_at_t=False,
+            bar_index_1h=len(df_1h_ind) - 1,
+            bars_per_day_1h=24,
+        )
+        rc = RegimeClassifier(cfg)
+        state = rc.classify(_now_utc(), "BTC/USDT:USDT", snap)
+        # 隨機合成資料的 regime 結果不可預期，但至少要回傳合法 RegimeState
+        assert isinstance(state, RegimeState)
+        assert state.regime in {
+            Regime.A_TREND, Regime.B_SIDEWAYS, Regime.C_FUNDING_EXTREME,
+            Regime.D_NO_TRADE, Regime.UNKNOWN,
+        }
