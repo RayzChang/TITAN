@@ -48,6 +48,7 @@ class RiskEngine:
         stop_price: float,
         risk_multiplier: float = 1.0,
         current_open_risk_pct: float = 0.0,
+        strategy_name: str | None = None,
     ) -> RiskPlan:
         """Build a single-trade risk plan.
 
@@ -71,6 +72,9 @@ class RiskEngine:
             rejection_reasons.append("SHORT_STOP_NOT_ABOVE_ENTRY")
 
         final_risk_pct = self.base_risk_pct * risk_multiplier
+        strategy_cap_pct = self._strategy_cap_pct(strategy_name)
+        if strategy_cap_pct is not None and final_risk_pct > strategy_cap_pct:
+            rejection_reasons.append("EXCEEDS_STRATEGY_RISK_CAP")
         if rejection_reasons:
             return self._rejected_plan(
                 symbol=symbol,
@@ -127,6 +131,8 @@ class RiskEngine:
                 "current_open_risk_pct": float(current_open_risk_pct),
                 "total_open_after": float(total_open_after),
                 "max_total_open_risk_pct": self.max_total_open_risk_pct,
+                "strategy_name": strategy_name,
+                "strategy_cap_pct": strategy_cap_pct,
             },
         )
 
@@ -179,6 +185,20 @@ class RiskEngine:
             "pair_in_scope": pair_in_scope,
             "matched_existing_symbols": matched_existing_symbols,
         }
+
+    def _strategy_cap_pct(self, strategy_name: str | None) -> float | None:
+        if not strategy_name:
+            return None
+        cap_cfg = self.cfg.risk.per_strategy_cap_pct
+        key_map = {
+            "trend_pullback": "trend",
+            "mean_reversion": "mean_reversion",
+        }
+        key = key_map.get(strategy_name, strategy_name)
+        data = cap_cfg.to_dict() if hasattr(cap_cfg, "to_dict") else {}
+        if key not in data:
+            return None
+        return float(data[key]) / 100.0
 
     def _rejected_plan(
         self,
