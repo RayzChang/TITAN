@@ -27,6 +27,7 @@ import pytest
 
 from strategies.r3.config_loader import R3Config
 from strategies.r3 import indicators as ind
+from strategies.r3.backtest_engine import BacktestEngine, completed_bars, completed_slice
 from strategies.r3.confirmation import (
     FundingReversalConfirmation5M,
     MeanReversionConfirmation5M,
@@ -55,9 +56,12 @@ from strategies.r3.funding_reversal import (
     evaluate_no_new_high_low,
 )
 from strategies.r3.mean_reversion import MeanReversionStrategy
+from strategies.r3.performance import calculate_metrics
 from strategies.r3.regime import Direction, Regime, RegimeState
 from strategies.r3.risk_engine import RiskEngine
 from strategies.r3.router import CooldownState, PositionState, R3Router
+from strategies.r3.simulator import ExitSimulator, FundingCostCalculator, OrderFillSimulator
+from strategies.r3.trade_log import Position
 from strategies.r3.trailing import (
     FundingReversalStopExitBuilder,
     MeanReversionStopExitBuilder,
@@ -1932,6 +1936,518 @@ def _make_clean_ohlcv(
     }, index=idx)
     df.index.name = "timestamp"
     return df
+
+
+def _bt_data(n_5m: int = 72, n_1h: int = 24, n_4h: int = 24) -> dict[str, dict[str, pd.DataFrame]]:
+    return {
+        "BTC/USDT:USDT": {
+            "5m": _make_clean_ohlcv(n_5m, "5m", seed=101),
+            "1h": _make_clean_ohlcv(n_1h, "1h", seed=102),
+            "4h": _make_clean_ohlcv(n_4h, "4h", seed=103),
+        }
+    }
+
+
+def _synthetic_lifecycle_data() -> dict[str, dict[str, pd.DataFrame]]:
+    start = datetime(2026, 1, 1, 8, tzinfo=UTC)
+    idx_5m = pd.date_range(start, periods=4, freq="5min", tz=UTC)
+    df_5m = pd.DataFrame(
+        {
+            "open": [100.0, 100.0, 100.5, 101.0],
+            "high": [100.2, 100.5, 102.0, 102.5],
+            "low": [99.8, 99.5, 100.2, 100.8],
+            "close": [100.0, 100.3, 101.5, 102.2],
+            "volume": [100.0, 100.0, 100.0, 100.0],
+        },
+        index=idx_5m,
+    )
+    df_5m.index.name = "timestamp"
+    return {
+        "BTC/USDT:USDT": {
+            "5m": df_5m,
+            "1h": _make_clean_ohlcv(12, "1h", start=datetime(2026, 1, 1, tzinfo=UTC), seed=201),
+            "4h": _make_clean_ohlcv(4, "4h", start=datetime(2026, 1, 1, tzinfo=UTC), seed=202),
+        }
+    }
+
+
+def _run_synthetic_lifecycle_backtest(
+    cfg: R3Config,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    output_dir=None,
+    include_funding: bool = True,
+):
+    engine = BacktestEngine(cfg)
+    state = RegimeState(
+        as_of=datetime(2026, 1, 1, 8, 5, tzinfo=UTC),
+        symbol="BTC/USDT:USDT",
+        regime=Regime.A_TREND,
+        regime_name=Regime.A_TREND.value,
+        direction=Direction.LONG.value,
+        allow_new_entries=True,
+    )
+    emitted = {"count": 0}
+
+    def fake_evaluate(**kwargs):
+        ts = kwargs["timestamp"]
+        if emitted["count"] > 0:
+            return SimpleNamespace(
+                strategy_name="trend_pullback",
+                direction="long",
+                approved=False,
+                entry_order_intent=None,
+            )
+        emitted["count"] += 1
+        signal_id = f"sig-{ts.isoformat()}"
+        return SimpleNamespace(
+            signal_id=signal_id,
+            timestamp=ts,
+            symbol="BTC/USDT:USDT",
+            strategy_name="trend_pullback",
+            direction="long",
+            approved=True,
+            entry_order_intent=OrderIntent(
+                symbol="BTC/USDT:USDT",
+                direction="long",
+                order_type="LIMIT_MAKER",
+                time_in_force="GTX",
+                limit_price=100.0,
+                quantity=1.0,
+                reduce_only=False,
+                expires_at=ts + timedelta(minutes=10),
+                signal_id=signal_id,
+            ),
+            stop_plan=SimpleNamespace(stop_price=95.0),
+            exit_plan=SimpleNamespace(
+                tp1_price=101.0,
+                tp1_fraction=0.5,
+                tp2_price=102.0,
+                tp2_fraction=0.5,
+                trailing_trigger_r=0.0,
+                risk_per_unit=5.0,
+                time_stop_hours=None,
+            ),
+        )
+
+    monkeypatch.setattr(engine, "_classify_regime", lambda *args, **kwargs: state)
+    monkeypatch.setattr(engine, "_evaluate_strategy", fake_evaluate)
+    funding_by_symbol = None
+    if include_funding:
+        funding_by_symbol = {
+            "BTC/USDT:USDT": pd.DataFrame(
+                {"funding_rate": [0.0]},
+                index=pd.DatetimeIndex([datetime(2026, 1, 1, 7, tzinfo=UTC)]),
+            )
+        }
+    return engine.run(
+        data_by_symbol=_synthetic_lifecycle_data(),
+        funding_by_symbol=funding_by_symbol,
+        output_dir=output_dir,
+    )
+
+
+def _order_intent(direction: str = "long", limit_price: float = 100.0) -> OrderIntent:
+    ts = datetime(2026, 1, 1, tzinfo=UTC)
+    return OrderIntent(
+        symbol="BTC/USDT:USDT",
+        direction=direction,
+        order_type="LIMIT_MAKER",
+        time_in_force="GTX",
+        limit_price=limit_price,
+        quantity=2.0,
+        reduce_only=False,
+        expires_at=ts + timedelta(minutes=10),
+        signal_id="sig-1",
+    )
+
+
+def _position(direction: str = "long") -> Position:
+    entry = datetime(2026, 1, 1, tzinfo=UTC)
+    return Position(
+        position_id="pos-1",
+        signal_id="sig-1",
+        symbol="BTC/USDT:USDT",
+        strategy_name="mean_reversion",
+        direction=direction,
+        entry_timestamp=entry,
+        entry_price=100.0,
+        quantity=1.0,
+        remaining_quantity=1.0,
+        stop_price=90.0 if direction == "long" else 110.0,
+        tp1_price=110.0 if direction == "long" else 90.0,
+        tp2_price=120.0 if direction == "long" else 80.0,
+        time_stop_at=entry + timedelta(hours=12),
+        trailing_state={"tp1_fraction": 0.5, "risk_per_unit": 10.0},
+    )
+
+
+# ---------------------------------------------------------------
+# Sprint 6 - Backtest / Strategy Simulation
+# ---------------------------------------------------------------
+class TestSprint6BacktestEngine:
+    def test_can_initialize_backtest_engine(self, cfg):
+        engine = BacktestEngine(cfg)
+        assert engine.initial_capital == pytest.approx(cfg.backtest.initial_capital)
+
+    def test_completed_slice_uses_only_closed_higher_timeframe_bars(self, cfg):
+        df = _make_clean_ohlcv(3, "1h", start=datetime(2026, 1, 1, tzinfo=UTC))
+        out = completed_slice(df, datetime(2026, 1, 1, 1, 30, tzinfo=UTC), "1h", cfg)
+        assert len(out) == 1
+        assert out.index[-1] == pd.Timestamp(datetime(2026, 1, 1, 1, tzinfo=UTC))
+
+    def test_premium_z_uses_close_time_alignment(self, cfg):
+        premium = pd.DataFrame(
+            {"close": np.linspace(0.0, 0.01, 130)},
+            index=pd.date_range(datetime(2026, 1, 1, tzinfo=UTC), periods=130, freq="1h"),
+        )
+        z = BacktestEngine(cfg)._prepare_premium_z(premium)
+        first_close = pd.Timestamp(datetime(2026, 1, 1, 1, tzinfo=UTC))
+        assert z.index[0] == first_close
+        assert pd.Timestamp(datetime(2026, 1, 1, tzinfo=UTC)) not in z.index
+        assert z.loc[z.index <= pd.Timestamp(datetime(2026, 1, 1, 0, 30, tzinfo=UTC))].empty
+
+    def test_can_run_single_symbol_short_data(self, cfg):
+        result = BacktestEngine(cfg).run(data_by_symbol=_bt_data())
+        assert "final_equity" in result.metrics
+        assert result.equity_curve.empty is False
+
+    def test_can_run_multi_symbol_short_data(self, cfg):
+        data = _bt_data()
+        data["ETH/USDT:USDT"] = {
+            "5m": _make_clean_ohlcv(72, "5m", seed=111),
+            "1h": _make_clean_ohlcv(24, "1h", seed=112),
+            "4h": _make_clean_ohlcv(24, "4h", seed=113),
+        }
+        result = BacktestEngine(cfg).run(data_by_symbol=data)
+        assert result.metrics["initial_capital"] == pytest.approx(cfg.backtest.initial_capital)
+
+    def test_synthetic_full_lifecycle_trade_updates_equity(self, cfg, monkeypatch):
+        result = _run_synthetic_lifecycle_backtest(cfg, monkeypatch)
+        assert result.fills[0].status == "FILLED"
+        assert result.metrics["total_trades"] >= 1
+        assert len(result.portfolio.closed_trades) >= 1
+        assert result.portfolio.open_positions == {}
+        assert result.trade_log.empty is False
+        assert result.trade_log.iloc[0]["exit_type"] == "TAKE_PROFIT_1"
+        assert result.portfolio.current_equity != pytest.approx(result.portfolio.initial_capital)
+        assert result.portfolio.total_fees > 0
+        assert result.portfolio.total_slippage > 0
+
+    @pytest.mark.parametrize("regime", [Regime.D_NO_TRADE, Regime.UNKNOWN])
+    def test_no_trade_regimes_do_not_select_strategy(self, cfg, regime):
+        state = RegimeState(
+            as_of=datetime(2026, 1, 1, tzinfo=UTC),
+            symbol="BTC/USDT:USDT",
+            regime=regime,
+            regime_name=str(regime.value),
+            direction=Direction.NONE.value,
+            allow_new_entries=False,
+        )
+        signal = BacktestEngine(cfg)._evaluate_strategy(
+            symbol="BTC/USDT:USDT",
+            timestamp=state.as_of,
+            regime_state=state,
+            df_1h=_make_clean_ohlcv(24, "1h"),
+            df_5m=_make_clean_ohlcv(72, "5m"),
+            equity=5000.0,
+            current_bid=100.0,
+            current_ask=100.1,
+        )
+        assert signal is None
+
+
+class TestSprint6OrderFillSimulation:
+    def test_long_limit_buy_fills_when_low_touches_limit(self, cfg):
+        bar = pd.Series({"low": 99.0, "high": 101.0})
+        fill = OrderFillSimulator(cfg).simulate_bar(
+            _order_intent("long", 100.0),
+            bar,
+            datetime(2026, 1, 1, 0, 5, tzinfo=UTC),
+            order_id="order-1",
+        )
+        assert fill.status == "FILLED"
+        assert fill.filled_quantity == pytest.approx(2.0)
+
+    def test_long_limit_buy_not_filled_when_low_above_limit(self, cfg):
+        bar = pd.Series({"low": 100.1, "high": 101.0})
+        fill = OrderFillSimulator(cfg).simulate_bar(
+            _order_intent("long", 100.0),
+            bar,
+            datetime(2026, 1, 1, 0, 5, tzinfo=UTC),
+            order_id="order-1",
+        )
+        assert fill.status == "REJECTED"
+        assert "LIMIT_NOT_TOUCHED" in fill.reason_codes
+
+    def test_short_limit_sell_fills_when_high_touches_limit(self, cfg):
+        bar = pd.Series({"low": 99.0, "high": 100.5})
+        fill = OrderFillSimulator(cfg).simulate_bar(
+            _order_intent("short", 100.0),
+            bar,
+            datetime(2026, 1, 1, 0, 5, tzinfo=UTC),
+            order_id="order-1",
+        )
+        assert fill.status == "FILLED"
+
+    def test_short_limit_sell_not_filled_when_high_below_limit(self, cfg):
+        bar = pd.Series({"low": 99.0, "high": 99.9})
+        fill = OrderFillSimulator(cfg).simulate_bar(
+            _order_intent("short", 100.0),
+            bar,
+            datetime(2026, 1, 1, 0, 5, tzinfo=UTC),
+            order_id="order-1",
+        )
+        assert fill.status == "REJECTED"
+
+    def test_timeout_expires_order(self, cfg):
+        expired = OrderFillSimulator(cfg).expire_if_needed(
+            _order_intent("long", 100.0),
+            datetime(2026, 1, 1, 0, 15, tzinfo=UTC),
+            order_id="order-1",
+        )
+        assert expired.status == "EXPIRED"
+
+    def test_fee_and_slippage_are_config_driven(self, cfg):
+        fill = OrderFillSimulator(cfg).simulate_bar(
+            _order_intent("long", 100.0),
+            pd.Series({"low": 99.0, "high": 101.0}),
+            datetime(2026, 1, 1, 0, 5, tzinfo=UTC),
+            order_id="order-1",
+        )
+        expected_slip = abs(fill.fill_price - 100.0) * fill.filled_quantity
+        expected_fee = fill.fill_price * fill.filled_quantity * (cfg.backtest.costs.maker_fee_bps / 10000)
+        assert fill.slippage == pytest.approx(expected_slip)
+        assert fill.fee == pytest.approx(expected_fee)
+
+
+class TestSprint6ExitSimulation:
+    def test_long_stop_hit(self, cfg):
+        event = ExitSimulator(cfg).simulate_bar(
+            _position("long"),
+            pd.Series({"low": 89.0, "high": 101.0, "close": 95.0}),
+            datetime(2026, 1, 1, 0, 5, tzinfo=UTC),
+        )[0]
+        assert event.exit_type == "STOP_LOSS"
+
+    def test_long_tp_hit(self, cfg):
+        events = ExitSimulator(cfg).simulate_bar(
+            _position("long"),
+            pd.Series({"low": 99.0, "high": 111.0, "close": 110.0}),
+            datetime(2026, 1, 1, 0, 5, tzinfo=UTC),
+        )
+        assert events[0].exit_type == "TAKE_PROFIT_1"
+
+    def test_short_stop_hit(self, cfg):
+        event = ExitSimulator(cfg).simulate_bar(
+            _position("short"),
+            pd.Series({"low": 99.0, "high": 111.0, "close": 105.0}),
+            datetime(2026, 1, 1, 0, 5, tzinfo=UTC),
+        )[0]
+        assert event.exit_type == "STOP_LOSS"
+
+    def test_short_tp_hit(self, cfg):
+        event = ExitSimulator(cfg).simulate_bar(
+            _position("short"),
+            pd.Series({"low": 89.0, "high": 101.0, "close": 90.0}),
+            datetime(2026, 1, 1, 0, 5, tzinfo=UTC),
+        )[0]
+        assert event.exit_type == "TAKE_PROFIT_1"
+
+    def test_same_bar_stop_first(self, cfg):
+        event = ExitSimulator(cfg).simulate_bar(
+            _position("long"),
+            pd.Series({"low": 89.0, "high": 111.0, "close": 100.0}),
+            datetime(2026, 1, 1, 0, 5, tzinfo=UTC),
+        )[0]
+        assert cfg.backtest.fill.same_bar_exit_priority == "conservative_stop_first"
+        assert event.exit_type == "STOP_LOSS"
+
+    def test_tp1_partial_exit_50_pct(self, cfg):
+        pos = _position("long")
+        event = ExitSimulator(cfg).simulate_bar(
+            pos,
+            pd.Series({"low": 99.0, "high": 111.0, "close": 110.0}),
+            datetime(2026, 1, 1, 0, 5, tzinfo=UTC),
+        )[0]
+        assert event.quantity == pytest.approx(0.5)
+        assert pos.remaining_quantity == pytest.approx(0.5)
+
+    def test_tp2_closes_remaining(self, cfg):
+        pos = _position("long")
+        pos.tp1_done = True
+        pos.remaining_quantity = 0.5
+        event = ExitSimulator(cfg).simulate_bar(
+            pos,
+            pd.Series({"low": 99.0, "high": 121.0, "close": 120.0}),
+            datetime(2026, 1, 1, 0, 5, tzinfo=UTC),
+        )[0]
+        assert event.exit_type == "TAKE_PROFIT_2"
+        assert pos.status == "CLOSED"
+
+    def test_time_stop_works(self, cfg):
+        event = ExitSimulator(cfg).simulate_bar(
+            _position("long"),
+            pd.Series({"low": 99.0, "high": 101.0, "close": 101.0}),
+            datetime(2026, 1, 1, 12, 0, tzinfo=UTC),
+        )[0]
+        assert event.exit_type == "TIME_STOP"
+
+    def test_realized_pnl_uses_direction(self, cfg):
+        event = ExitSimulator(cfg).simulate_bar(
+            _position("short"),
+            pd.Series({"low": 89.0, "high": 101.0, "close": 90.0}),
+            datetime(2026, 1, 1, 0, 5, tzinfo=UTC),
+        )[0]
+        assert event.realized_pnl > 0
+
+
+class TestSprint6FundingCost:
+    def test_long_pays_positive_funding(self, cfg):
+        funding = pd.DataFrame(
+            {"funding_rate": [0.001]},
+            index=pd.DatetimeIndex([datetime(2026, 1, 1, 8, tzinfo=UTC)]),
+        )
+        result = FundingCostCalculator(cfg).calculate(
+            position=_position("long"),
+            exit_timestamp=datetime(2026, 1, 1, 9, tzinfo=UTC),
+            funding_df=funding,
+        )
+        assert result.funding_cost > 0
+
+    def test_long_receives_negative_funding(self, cfg):
+        funding = pd.DataFrame(
+            {"funding_rate": [-0.001]},
+            index=pd.DatetimeIndex([datetime(2026, 1, 1, 8, tzinfo=UTC)]),
+        )
+        result = FundingCostCalculator(cfg).calculate(
+            position=_position("long"),
+            exit_timestamp=datetime(2026, 1, 1, 9, tzinfo=UTC),
+            funding_df=funding,
+        )
+        assert result.funding_cost < 0
+
+    def test_short_receives_positive_funding(self, cfg):
+        funding = pd.DataFrame(
+            {"funding_rate": [0.001]},
+            index=pd.DatetimeIndex([datetime(2026, 1, 1, 8, tzinfo=UTC)]),
+        )
+        result = FundingCostCalculator(cfg).calculate(
+            position=_position("short"),
+            exit_timestamp=datetime(2026, 1, 1, 9, tzinfo=UTC),
+            funding_df=funding,
+        )
+        assert result.funding_cost < 0
+
+    def test_short_pays_negative_funding(self, cfg):
+        funding = pd.DataFrame(
+            {"funding_rate": [-0.001]},
+            index=pd.DatetimeIndex([datetime(2026, 1, 1, 8, tzinfo=UTC)]),
+        )
+        result = FundingCostCalculator(cfg).calculate(
+            position=_position("short"),
+            exit_timestamp=datetime(2026, 1, 1, 9, tzinfo=UTC),
+            funding_df=funding,
+        )
+        assert result.funding_cost > 0
+
+    def test_missing_funding_marks_warning(self, cfg):
+        result = FundingCostCalculator(cfg).calculate(
+            position=_position("long"),
+            exit_timestamp=datetime(2026, 1, 1, 9, tzinfo=UTC),
+            funding_df=None,
+        )
+        assert "FUNDING_DATA_MISSING" in result.reason_codes
+
+
+class TestSprint6Reports:
+    def test_report_files_are_written(self, cfg, tmp_path):
+        result = BacktestEngine(cfg).run(
+            data_by_symbol=_bt_data(),
+            output_dir=tmp_path,
+        )
+        for name in [
+            "trade_log",
+            "daily_pnl",
+            "equity_curve",
+            "drawdown_curve",
+            "metrics",
+            "report",
+        ]:
+            assert result.report_paths[name].exists()
+
+    def test_funding_missing_warning_is_reported(self, cfg, tmp_path, monkeypatch):
+        result = _run_synthetic_lifecycle_backtest(
+            cfg,
+            monkeypatch,
+            output_dir=tmp_path,
+            include_funding=False,
+        )
+        assert "FUNDING_DATA_MISSING" in result.metrics["data_warnings"]
+        assert "FUNDING_DATA_MISSING" in result.data_warnings
+        assert "FUNDING_DATA_MISSING" in result.report_paths["report"].read_text(encoding="utf-8")
+
+    def test_backtest_smoke_reports_are_gitignored(self):
+        from pathlib import Path
+
+        ignore_file = Path(__file__).resolve().parents[1] / ".gitignore"
+        assert "reports/backtest_smoke/" in ignore_file.read_text(encoding="utf-8")
+
+    def test_metrics_fields_complete(self, cfg):
+        result = BacktestEngine(cfg).run(data_by_symbol=_bt_data())
+        for field in [
+            "initial_capital",
+            "final_equity",
+            "net_profit",
+            "total_return_pct",
+            "max_drawdown_pct",
+            "total_trades",
+            "win_rate",
+            "profit_factor",
+            "average_trade_pnl",
+            "average_trade_r",
+            "average_daily_pnl",
+            "median_daily_pnl",
+            "best_day",
+            "worst_day",
+            "total_fees",
+            "total_slippage",
+            "total_funding",
+            "sharpe_ratio",
+            "calmar_ratio",
+        ]:
+            assert field in result.metrics
+
+
+class TestSprint6Regression:
+    def test_no_forbidden_sprint6_implementations(self):
+        import re
+        from pathlib import Path
+        root = Path(__file__).resolve().parents[1]
+        checked = [
+            root / "strategies" / "r3" / "backtest_engine.py",
+            root / "strategies" / "r3" / "simulator.py",
+            root / "strategies" / "r3" / "performance.py",
+            root / "strategies" / "r3" / "trade_log.py",
+            root / "tools" / "r3_backtest_smoke.py",
+        ]
+        for path in checked:
+            text = path.read_text(encoding="utf-8")
+            text = re.sub(r'(?s)"""(?:.*?)"""|\'\'\'(?:.*?)\'\'\'', "", text)
+            for forbidden in [
+                "create_order",
+                "place_order",
+                "market_order",
+                "ccxt",
+                "WalkForward",
+                "MCPT",
+                "BlockBootstrap",
+                "Bonferroni",
+                "FinalOOS",
+                "Sprint 7",
+                "Sprint-7",
+            ]:
+                assert forbidden not in text
 
 
 # ---------------------------------------------------------------

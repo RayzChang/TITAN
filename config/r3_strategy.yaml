@@ -469,7 +469,38 @@ funding:
     funding_filter_weight: "light"
 
 # -------------------------------------------------------------
-# 11. Pivot Detection (§4.6, §7.2)
+# 11. Backtest Simulation (Sprint 6)
+# -------------------------------------------------------------
+backtest:
+  initial_capital: 5000
+
+  data:
+    input_index: "open_time"
+    bars_per_day_1h: 24
+
+  execution:
+    tick_size_default: 0.01
+    synthetic_spread_bps: 1.0
+
+  costs:
+    maker_fee_bps: 2.0
+    taker_fee_bps: 5.0
+    slippage_bps: 1.0
+
+  fill:
+    same_bar_exit_priority: "conservative_stop_first"
+    partial_fill_enabled: false
+    full_fill_ratio: 1.0
+
+  reports:
+    output_root: "reports/backtest_smoke/R3"
+    smoke_lookback_days: 30
+
+  metrics:
+    annualization_days: 365
+
+# -------------------------------------------------------------
+# 12. Pivot Detection (§4.6, §7.2)
 # -------------------------------------------------------------
 pivot:
   normal:
