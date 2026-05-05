@@ -1,4 +1,4 @@
-"""R3 Sprint 4 strategy router v1.
+"""R3 strategy router v1.
 
 The router only selects or rejects candidate signals. It does not place orders
 or mutate position/session state.
@@ -71,6 +71,7 @@ class R3Router:
         regime_state: RegimeState,
         trend_signal_result: Any | None = None,
         mean_reversion_signal_result: Any | None = None,
+        funding_reversal_signal_result: Any | None = None,
         existing_position_state: PositionState | None = None,
         cooldown_state: CooldownState | None = None,
         session_status: SessionStatus | None = None,
@@ -95,24 +96,11 @@ class R3Router:
                 ["REJECT_REGIME_UNKNOWN"],
                 session_status,
             )
-        if _is_regime(regime_state, Regime.C_FUNDING_EXTREME):
-            return RouterDecision(
-                timestamp=timestamp,
-                symbol=symbol,
-                regime_state=regime_state,
-                selected_strategy=None,
-                signal_result=None,
-                approved=False,
-                deferred=True,
-                reason_codes=["REGIME_C_DEFERRED"],
-                rejection_reasons=["NO_SPRINT4_STRATEGY_FOR_REGIME_C"],
-                metrics_snapshot=_metrics(session_status),
-            )
-
         selected_strategy, candidate = self._candidate_for_regime(
             regime_state,
             trend_signal_result,
             mean_reversion_signal_result,
+            funding_reversal_signal_result,
         )
         if selected_strategy is None:
             return self._reject(
@@ -165,7 +153,7 @@ class R3Router:
             selected_strategy=selected_strategy,
             signal_result=candidate,
             approved=True,
-            reason_codes=[f"ROUTED_TO_{selected_strategy.upper()}"],
+            reason_codes=_approval_reason_codes(selected_strategy),
             metrics_snapshot=_metrics(session_status),
         )
 
@@ -174,11 +162,14 @@ class R3Router:
         regime_state: RegimeState,
         trend_signal_result: Any | None,
         mean_reversion_signal_result: Any | None,
+        funding_reversal_signal_result: Any | None,
     ) -> tuple[str | None, Any | None]:
         if _is_regime(regime_state, Regime.A_TREND):
             return "trend_pullback", trend_signal_result
         if _is_regime(regime_state, Regime.B_SIDEWAYS):
             return "mean_reversion", mean_reversion_signal_result
+        if _is_regime(regime_state, Regime.C_FUNDING_EXTREME):
+            return "funding_reversal", funding_reversal_signal_result
         return None, None
 
     def _position_rejections(
@@ -252,3 +243,10 @@ def _metrics(session_status: SessionStatus | None) -> dict[str, Any]:
         "daily_pnl_pct": session_status.daily_pnl_pct,
         "consecutive_losses": session_status.consecutive_losses,
     }
+
+
+def _approval_reason_codes(selected_strategy: str) -> list[str]:
+    out = [f"ROUTED_TO_{selected_strategy.upper()}"]
+    if selected_strategy == "funding_reversal":
+        out.append("ROUTER_ALLOW_FUNDING_REVERSAL")
+    return out
