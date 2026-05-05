@@ -40,3 +40,4 @@ state.json
 .claude/settings.local.json
 data/_archive/
 data/r3_cache/
+reports/backtest_smoke/
