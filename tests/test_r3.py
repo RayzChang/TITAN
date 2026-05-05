@@ -19,6 +19,7 @@ Config : config/r3_strategy.yaml
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -26,7 +27,7 @@ import pytest
 
 from strategies.r3.config_loader import R3Config
 from strategies.r3 import indicators as ind
-from strategies.r3.confirmation import TrendConfirmation5M
+from strategies.r3.confirmation import MeanReversionConfirmation5M, TrendConfirmation5M
 from strategies.r3.data_loader import (
     R3DataLoader,
     IntegrityReport,
@@ -36,11 +37,18 @@ from strategies.r3.data_loader import (
     _symbol_to_filename,
     TIMEFRAME_TO_SECONDS,
 )
-from strategies.r3.executor import OrderIntent, PartialFillSimulator, TrendOrderIntentBuilder
+from strategies.r3.executor import (
+    MeanReversionOrderIntentBuilder,
+    OrderIntent,
+    PartialFillSimulator,
+    TrendOrderIntentBuilder,
+)
 from strategies.r3.exchange import R3ExchangeData
+from strategies.r3.mean_reversion import MeanReversionStrategy
 from strategies.r3.regime import Direction, Regime, RegimeState
 from strategies.r3.risk_engine import RiskEngine
-from strategies.r3.trailing import TrendStopExitBuilder
+from strategies.r3.router import CooldownState, PositionState, R3Router
+from strategies.r3.trailing import MeanReversionStopExitBuilder, TrendStopExitBuilder
 from strategies.r3.trend_pullback import (
     TrendPullbackStrategy,
     evaluate_pullback_zone,
@@ -114,6 +122,78 @@ def _trend_5m_df(direction: str = "long") -> pd.DataFrame:
         "close": closes,
         "volume": [100.0] * len(closes),
         "atr_14": [0.5] * len(closes),
+    }, index=idx)
+
+
+def _mr_5m_df(direction: str = "long", only_one_condition: bool = False) -> pd.DataFrame:
+    idx = pd.date_range(datetime(2026, 1, 1, 4, 35, tzinfo=timezone.utc), periods=15, freq="5min")
+    opens = [100.0] * 15
+    highs = [101.0] * 15
+    lows = [99.0] * 15
+    closes = [100.0] * 15
+    rsi_values = [50.0] * 15
+    if direction == "long":
+        opens[-2:] = [99.0, 98.0]
+        highs[-2:] = [100.0, 100.0]
+        lows[-2:] = [97.0, 95.0]
+        closes[-2:] = [98.0, 98.5]
+        rsi_values[-2:] = [28.0, 29.0]
+        if only_one_condition:
+            opens[-1] = 98.1
+            highs[-1] = 99.0
+            lows[-1] = 98.0
+            closes[-1] = 98.8
+            rsi_values[-2:] = [35.0, 34.0]
+    else:
+        opens[-2:] = [101.0, 102.0]
+        highs[-2:] = [103.0, 105.0]
+        lows[-2:] = [100.0, 100.0]
+        closes[-2:] = [102.0, 101.5]
+        rsi_values[-2:] = [72.0, 71.0]
+        if only_one_condition:
+            rsi_values[-2:] = [65.0, 66.0]
+    return pd.DataFrame({
+        "open": opens,
+        "high": highs,
+        "low": lows,
+        "close": closes,
+        "volume": [100.0] * len(closes),
+        "rsi_14": rsi_values,
+        "atr_14": [0.5] * len(closes),
+    }, index=idx)
+
+
+def _mr_1h_df(direction: str = "long") -> pd.DataFrame:
+    idx = pd.date_range(datetime(2026, 1, 1, 0, tzinfo=timezone.utc), periods=6, freq="1h")
+    if direction == "long":
+        close = [100.0, 99.0, 98.0, 97.0, 96.0, 95.0]
+        bb_lower = [96.0] * 6
+        bb_upper = [104.0] * 6
+        vwap_lower = [96.5] * 6
+        vwap_upper = [103.5] * 6
+        rsi_values = [40.0, 35.0, 31.0, 29.0, 28.0, 27.0]
+    else:
+        close = [100.0, 101.0, 102.0, 103.0, 104.0, 105.0]
+        bb_lower = [96.0] * 6
+        bb_upper = [104.0] * 6
+        vwap_lower = [96.5] * 6
+        vwap_upper = [104.5] * 6
+        rsi_values = [60.0, 65.0, 69.0, 71.0, 72.0, 73.0]
+    return pd.DataFrame({
+        "open": close,
+        "high": [value + 1.0 for value in close],
+        "low": [value - 1.0 for value in close],
+        "close": close,
+        "volume": [100.0] * 6,
+        "bb_lower": bb_lower,
+        "bb_middle": [100.0] * 6,
+        "bb_upper": bb_upper,
+        "vwap": [101.0 if direction == "long" else 99.0] * 6,
+        "vwap_lower": vwap_lower,
+        "vwap_upper": vwap_upper,
+        "vwap_stdev": [1.0] * 6,
+        "rsi_14": rsi_values,
+        "atr_14": [2.0] * 6,
     }, index=idx)
 
 
@@ -282,10 +362,48 @@ class TestQ24OppositePositionForbidden:
         assert opp.wait_until_existing_closed is True
 
     def test_btc_long_held_short_signal_should_be_rejected(self, cfg):
-        pytest.skip("TODO[Sprint-4-or-Router]: with BTC long open, BTC short signal must be rejected")
+        signal = SimpleNamespace(
+            approved=True,
+            direction="short",
+            strategy_name="trend_pullback",
+        )
+        decision = R3Router(cfg).route(
+            symbol="BTC/USDT:USDT",
+            timestamp=datetime(2026, 1, 1, 5, tzinfo=timezone.utc),
+            regime_state=_manual_regime_state(regime=Regime.A_TREND, direction="short"),
+            trend_signal_result=signal,
+            existing_position_state=PositionState(
+                symbol="BTC/USDT:USDT",
+                has_position=True,
+                direction="long",
+                strategy_name="trend_pullback",
+                quantity=1.0,
+                entry_price=100.0,
+            ),
+        )
+        assert decision.approved is False
+        assert "REJECT_OPPOSITE_POSITION_EXISTS" in decision.rejection_reasons
+        assert "REJECT_HEDGE_MODE_DISABLED" in decision.rejection_reasons
+        assert "WAIT_FOR_EXISTING_POSITION_EXIT" in decision.rejection_reasons
 
     def test_after_existing_closed_new_direction_allowed(self, cfg):
-        pytest.skip("TODO[Sprint-4-or-Router]: after TP/SL exit, opposite direction signal allowed")
+        signal = SimpleNamespace(
+            approved=True,
+            direction="short",
+            strategy_name="trend_pullback",
+        )
+        decision = R3Router(cfg).route(
+            symbol="BTC/USDT:USDT",
+            timestamp=datetime(2026, 1, 1, 5, tzinfo=timezone.utc),
+            regime_state=_manual_regime_state(regime=Regime.A_TREND, direction="short"),
+            trend_signal_result=signal,
+            existing_position_state=PositionState(
+                symbol="BTC/USDT:USDT",
+                has_position=False,
+            ),
+        )
+        assert decision.approved is True
+        assert decision.selected_strategy == "trend_pullback"
 
 
 # ===============================================================
@@ -314,10 +432,64 @@ class TestQ25MRConfirmation:
             "Mean reversion confirmation must not use breakout-type signals"
 
     def test_strong_close_plus_rsi_uptick_should_qualify(self, cfg):
-        pytest.skip("TODO[Sprint-4]: 2/3 conditions met")
+        df = _mr_5m_df("long")
+        result = MeanReversionConfirmation5M(cfg).check(
+            df,
+            df.index[-1],
+            "BTC/USDT:USDT",
+            "long",
+        )
+        assert result.passed is True
+        assert result.strategy_name == "mean_reversion"
+        assert "MR_BULLISH_CLOSE" in result.conditions_passed
+        assert "MR_RSI_REVERSAL_LONG" in result.conditions_passed
+        assert "MR_CONFIRMATION_PASSED" in result.reason_codes
 
     def test_only_one_condition_should_not_qualify(self, cfg):
-        pytest.skip("TODO[Sprint-4]: only 1/3 fails")
+        df = _mr_5m_df("long", only_one_condition=True)
+        result = MeanReversionConfirmation5M(cfg).check(
+            df,
+            df.index[-1],
+            "BTC/USDT:USDT",
+            "long",
+        )
+        assert result.passed is False
+        assert result.conditions_passed == ["MR_BULLISH_CLOSE"]
+        assert "MR_CONFIRMATION_FAILED" in result.reason_codes
+
+    def test_short_two_of_three_should_qualify(self, cfg):
+        df = _mr_5m_df("short")
+        result = MeanReversionConfirmation5M(cfg).check(
+            df,
+            df.index[-1],
+            "BTC/USDT:USDT",
+            "short",
+        )
+        assert result.passed is True
+        assert "MR_BEARISH_CLOSE" in result.conditions_passed
+        assert "MR_RSI_REVERSAL_SHORT" in result.conditions_passed
+
+    def test_mr_rsi_reversal_long_correct(self, cfg):
+        df = _mr_5m_df("long")
+        result = MeanReversionConfirmation5M(cfg).check_long(
+            df,
+            df.index[-1],
+            "BTC/USDT:USDT",
+        )
+        assert result.metrics_snapshot["current_rsi"] == pytest.approx(29.0)
+        assert result.metrics_snapshot["previous_rsi"] == pytest.approx(28.0)
+        assert "MR_RSI_REVERSAL_LONG" in result.conditions_passed
+
+    def test_mr_rsi_reversal_short_correct(self, cfg):
+        df = _mr_5m_df("short")
+        result = MeanReversionConfirmation5M(cfg).check_short(
+            df,
+            df.index[-1],
+            "BTC/USDT:USDT",
+        )
+        assert result.metrics_snapshot["current_rsi"] == pytest.approx(71.0)
+        assert result.metrics_snapshot["previous_rsi"] == pytest.approx(72.0)
+        assert "MR_RSI_REVERSAL_SHORT" in result.conditions_passed
 
 
 # ===============================================================
@@ -451,13 +623,77 @@ class TestQ29SameStrategyCooldown:
         assert cd.tp_exit_1h_bars == 0
 
     def test_sl_exit_blocks_next_1h_signal(self, cfg):
-        pytest.skip("TODO[Sprint-4-or-RiskSession]: BTC trend SL at T -> reject BTC trend signal at T+1H")
+        now = datetime(2026, 1, 1, 5, 30, tzinfo=timezone.utc)
+        signal = SimpleNamespace(approved=True, direction="long", strategy_name="trend_pullback")
+        decision = R3Router(cfg).route(
+            symbol="BTC/USDT:USDT",
+            timestamp=now,
+            regime_state=_manual_regime_state(regime=Regime.A_TREND, direction="long"),
+            trend_signal_result=signal,
+            cooldown_state=CooldownState(
+                symbol="BTC/USDT:USDT",
+                strategy_name="trend_pullback",
+                last_exit_reason="SL",
+                last_exit_time=datetime(2026, 1, 1, 5, tzinfo=timezone.utc),
+                cooldown_until=datetime(2026, 1, 1, 6, tzinfo=timezone.utc),
+            ),
+        )
+        assert decision.approved is False
+        assert "REJECT_COOLDOWN_ACTIVE" in decision.rejection_reasons
 
     def test_tp_exit_does_not_block(self, cfg):
-        pytest.skip("TODO[Sprint-4-or-RiskSession]: BTC trend TP at T -> allow BTC trend signal at T+1H")
+        now = datetime(2026, 1, 1, 5, 30, tzinfo=timezone.utc)
+        signal = SimpleNamespace(approved=True, direction="long", strategy_name="trend_pullback")
+        decision = R3Router(cfg).route(
+            symbol="BTC/USDT:USDT",
+            timestamp=now,
+            regime_state=_manual_regime_state(regime=Regime.A_TREND, direction="long"),
+            trend_signal_result=signal,
+            cooldown_state=CooldownState(
+                symbol="BTC/USDT:USDT",
+                strategy_name="trend_pullback",
+                last_exit_reason="TP",
+                last_exit_time=datetime(2026, 1, 1, 5, tzinfo=timezone.utc),
+                cooldown_until=datetime(2026, 1, 1, 6, tzinfo=timezone.utc),
+            ),
+        )
+        assert decision.approved is True
 
     def test_cooldown_only_applies_per_symbol_per_strategy(self, cfg):
-        pytest.skip("TODO[Sprint-4-or-RiskSession]: BTC SL does not block ETH trend, nor BTC mean_reversion")
+        now = datetime(2026, 1, 1, 5, 30, tzinfo=timezone.utc)
+        eth_signal = SimpleNamespace(approved=True, direction="long", strategy_name="trend_pullback")
+        eth_decision = R3Router(cfg).route(
+            symbol="ETH/USDT:USDT",
+            timestamp=now,
+            regime_state=_manual_regime_state(regime=Regime.A_TREND, direction="long"),
+            trend_signal_result=eth_signal,
+            cooldown_state=CooldownState(
+                symbol="BTC/USDT:USDT",
+                strategy_name="trend_pullback",
+                last_exit_reason="SL",
+                last_exit_time=datetime(2026, 1, 1, 5, tzinfo=timezone.utc),
+                cooldown_until=datetime(2026, 1, 1, 6, tzinfo=timezone.utc),
+            ),
+        )
+        mr_signal = SimpleNamespace(approved=True, direction="long", strategy_name="mean_reversion")
+        mr_decision = R3Router(cfg).route(
+            symbol="BTC/USDT:USDT",
+            timestamp=now,
+            regime_state=_manual_regime_state(
+                regime=Regime.B_SIDEWAYS,
+                direction=Direction.NEUTRAL.value,
+            ),
+            mean_reversion_signal_result=mr_signal,
+            cooldown_state=CooldownState(
+                symbol="BTC/USDT:USDT",
+                strategy_name="trend_pullback",
+                last_exit_reason="SL",
+                last_exit_time=datetime(2026, 1, 1, 5, tzinfo=timezone.utc),
+                cooldown_until=datetime(2026, 1, 1, 6, tzinfo=timezone.utc),
+            ),
+        )
+        assert eth_decision.approved is True
+        assert mr_decision.approved is True
 
 
 # ===============================================================
@@ -759,6 +995,365 @@ class TestSprint3Regression:
         text = src.read_text(encoding="utf-8")
         for forbidden in ["BacktestEngine", "from .mean_reversion", "from .funding_reversal", "position_manager"]:
             assert forbidden not in text
+
+
+class TestSprint4MeanReversionStrategy:
+    def test_regime_b_long_full_stack_approves_signal(self, cfg):
+        as_of = datetime(2026, 1, 1, 5, 45, tzinfo=timezone.utc)
+        result = MeanReversionStrategy(cfg).evaluate(
+            symbol="BTC/USDT:USDT",
+            as_of=as_of,
+            regime_state=_manual_regime_state(
+                regime=Regime.B_SIDEWAYS,
+                direction=Direction.NEUTRAL.value,
+            ),
+            df_1h=_mr_1h_df("long"),
+            df_5m=_mr_5m_df("long"),
+            equity=5000.0,
+            current_bid=95.0,
+            current_ask=95.1,
+            tick_size=0.01,
+        )
+        assert result.approved is True
+        assert result.strategy_name == "mean_reversion"
+        assert result.direction == "long"
+        assert result.confirmation_result.strategy_name == "mean_reversion"
+        assert result.risk_plan is not None
+        assert result.stop_plan.strategy_name == "mean_reversion"
+        assert result.exit_plan.strategy_name == "mean_reversion"
+        assert result.entry_order_intent is not None
+
+    def test_regime_b_short_full_stack_approves_signal(self, cfg):
+        as_of = datetime(2026, 1, 1, 5, 45, tzinfo=timezone.utc)
+        result = MeanReversionStrategy(cfg).evaluate(
+            symbol="BTC/USDT:USDT",
+            as_of=as_of,
+            regime_state=_manual_regime_state(
+                regime=Regime.B_SIDEWAYS,
+                direction=Direction.NEUTRAL.value,
+            ),
+            df_1h=_mr_1h_df("short"),
+            df_5m=_mr_5m_df("short"),
+            equity=5000.0,
+            current_bid=105.0,
+            current_ask=105.1,
+            tick_size=0.01,
+        )
+        assert result.approved is True
+        assert result.direction == "short"
+        assert result.entry_order_intent.limit_price == pytest.approx(105.11)
+
+    @pytest.mark.parametrize("regime", [Regime.A_TREND, Regime.UNKNOWN, Regime.D_NO_TRADE])
+    def test_non_b_regimes_reject(self, cfg, regime):
+        result = MeanReversionStrategy(cfg).evaluate(
+            symbol="BTC/USDT:USDT",
+            as_of=datetime(2026, 1, 1, 5, 45, tzinfo=timezone.utc),
+            regime_state=_manual_regime_state(
+                regime=regime,
+                direction=Direction.NEUTRAL.value,
+            ),
+            df_1h=_mr_1h_df("long"),
+            df_5m=_mr_5m_df("long"),
+            equity=5000.0,
+            current_bid=95.0,
+            current_ask=95.1,
+            tick_size=0.01,
+        )
+        assert result.approved is False
+        assert "REGIME_NOT_B" in result.rejection_reasons
+
+    def test_funding_extreme_rejects(self, cfg):
+        result = MeanReversionStrategy(cfg).evaluate(
+            symbol="BTC/USDT:USDT",
+            as_of=datetime(2026, 1, 1, 5, 45, tzinfo=timezone.utc),
+            regime_state=_manual_regime_state(
+                regime=Regime.B_SIDEWAYS,
+                direction=Direction.NEUTRAL.value,
+                funding_z=1.6,
+            ),
+            df_1h=_mr_1h_df("long"),
+            df_5m=_mr_5m_df("long"),
+            equity=5000.0,
+            current_bid=95.0,
+            current_ask=95.1,
+            tick_size=0.01,
+        )
+        assert result.approved is False
+        assert "FUNDING_NOT_NEUTRAL" in result.rejection_reasons
+
+    def test_extreme_vol_rejects(self, cfg):
+        result = MeanReversionStrategy(cfg).evaluate(
+            symbol="BTC/USDT:USDT",
+            as_of=datetime(2026, 1, 1, 5, 45, tzinfo=timezone.utc),
+            regime_state=_manual_regime_state(
+                regime=Regime.B_SIDEWAYS,
+                direction=Direction.NEUTRAL.value,
+                extreme_vol=True,
+            ),
+            df_1h=_mr_1h_df("long"),
+            df_5m=_mr_5m_df("long"),
+            equity=5000.0,
+            current_bid=95.0,
+            current_ask=95.1,
+            tick_size=0.01,
+        )
+        assert result.approved is False
+        assert "EXTREME_VOL" in result.rejection_reasons
+
+    def test_allow_new_entries_false_rejects(self, cfg):
+        result = MeanReversionStrategy(cfg).evaluate(
+            symbol="BTC/USDT:USDT",
+            as_of=datetime(2026, 1, 1, 5, 45, tzinfo=timezone.utc),
+            regime_state=_manual_regime_state(
+                regime=Regime.B_SIDEWAYS,
+                direction=Direction.NEUTRAL.value,
+                allow_new_entries=False,
+            ),
+            df_1h=_mr_1h_df("long"),
+            df_5m=_mr_5m_df("long"),
+            equity=5000.0,
+            current_bid=95.0,
+            current_ask=95.1,
+            tick_size=0.01,
+        )
+        assert result.approved is False
+        assert "ALLOW_NEW_ENTRIES_FALSE" in result.rejection_reasons
+
+    def test_mr_cannot_use_trend_breakout_confirmation(self, cfg):
+        df = _mr_5m_df("long", only_one_condition=True)
+        df.loc[df.index[-1], "close"] = float(df["high"].iloc[-4:-1].max()) + 10.0
+        result = MeanReversionConfirmation5M(cfg).check_long(
+            df,
+            df.index[-1],
+            "BTC/USDT:USDT",
+        )
+        assert result.passed is False
+        assert all("BREAK" not in code.upper() for code in result.conditions_passed)
+
+
+class TestSprint4MRStopExitExecutor:
+    def test_long_stop_uses_mr_atr_multiplier(self, cfg):
+        stop = MeanReversionStopExitBuilder(cfg).build_stop_plan(
+            symbol="BTC/USDT:USDT",
+            direction="long",
+            entry_price=100.0,
+            atr_1h=2.0,
+        )
+        assert cfg.mean_reversion.exit.sl_atr_mult == pytest.approx(1.0)
+        assert stop.stop_source == "ATR_MR"
+        assert stop.stop_price == pytest.approx(98.0)
+
+    def test_short_stop_uses_mr_atr_multiplier(self, cfg):
+        stop = MeanReversionStopExitBuilder(cfg).build_stop_plan(
+            symbol="BTC/USDT:USDT",
+            direction="short",
+            entry_price=100.0,
+            atr_1h=2.0,
+        )
+        assert stop.stop_source == "ATR_MR"
+        assert stop.stop_price == pytest.approx(102.0)
+
+    def test_long_target_uses_conservative_min(self, cfg):
+        plan = MeanReversionStopExitBuilder(cfg).build_exit_plan(
+            symbol="BTC/USDT:USDT",
+            direction="long",
+            entry_price=95.0,
+            stop_price=93.0,
+            bb_middle=100.0,
+            vwap=101.0,
+        )
+        assert plan.tp1_price == pytest.approx(100.0)
+        assert plan.target_source == "CONSERVATIVE_TARGET"
+        assert plan.time_stop_hours == pytest.approx(12.0)
+
+    def test_short_target_uses_conservative_max(self, cfg):
+        plan = MeanReversionStopExitBuilder(cfg).build_exit_plan(
+            symbol="BTC/USDT:USDT",
+            direction="short",
+            entry_price=105.0,
+            stop_price=107.0,
+            bb_middle=100.0,
+            vwap=99.0,
+        )
+        assert plan.tp1_price == pytest.approx(100.0)
+        assert plan.target_source == "CONSERVATIVE_TARGET"
+        assert plan.time_stop_hours == pytest.approx(12.0)
+
+    def test_long_mr_limit_price(self, cfg):
+        price = MeanReversionOrderIntentBuilder(cfg).compute_limit_price(
+            direction="long",
+            current_bid=95.0,
+            current_ask=95.1,
+            tick_size=0.01,
+            signal_5m_close=94.9,
+        )
+        assert price == pytest.approx(94.9)
+
+    def test_short_mr_limit_price(self, cfg):
+        price = MeanReversionOrderIntentBuilder(cfg).compute_limit_price(
+            direction="short",
+            current_bid=105.0,
+            current_ask=105.1,
+            tick_size=0.01,
+            signal_5m_close=105.2,
+        )
+        assert price == pytest.approx(105.2)
+
+    def test_mr_order_intent_expires_after_10_minutes(self, cfg):
+        ts = datetime(2026, 1, 1, 5, 45, tzinfo=timezone.utc)
+        intent = MeanReversionOrderIntentBuilder(cfg).build_entry_intent(
+            symbol="BTC/USDT:USDT",
+            direction="long",
+            signal_timestamp=ts,
+            current_bid=95.0,
+            current_ask=95.1,
+            tick_size=0.01,
+            signal_5m_close=94.9,
+            quantity=1.0,
+            signal_id="mr-sig-1",
+        )
+        assert intent.expires_at == ts + timedelta(minutes=10)
+        assert intent.reduce_only is False
+        assert intent.reason_codes == ["MEAN_REVERSION_MAKER_LIMIT_INTENT"]
+
+
+class TestSprint4RouterV1:
+    def test_regime_d_rejects_all_new_entries(self, cfg):
+        decision = R3Router(cfg).route(
+            symbol="BTC/USDT:USDT",
+            timestamp=datetime(2026, 1, 1, 5, tzinfo=timezone.utc),
+            regime_state=_manual_regime_state(regime=Regime.D_NO_TRADE, direction="none"),
+            trend_signal_result=SimpleNamespace(approved=True, direction="long"),
+            mean_reversion_signal_result=SimpleNamespace(approved=True, direction="long"),
+        )
+        assert decision.approved is False
+        assert "REJECT_REGIME_D_NO_TRADE" in decision.rejection_reasons
+
+    def test_regime_a_only_allows_trend_pullback(self, cfg):
+        decision = R3Router(cfg).route(
+            symbol="BTC/USDT:USDT",
+            timestamp=datetime(2026, 1, 1, 5, tzinfo=timezone.utc),
+            regime_state=_manual_regime_state(regime=Regime.A_TREND, direction="long"),
+            trend_signal_result=SimpleNamespace(approved=True, direction="long"),
+            mean_reversion_signal_result=SimpleNamespace(approved=True, direction="short"),
+        )
+        assert decision.approved is True
+        assert decision.selected_strategy == "trend_pullback"
+
+    def test_regime_b_only_allows_mean_reversion(self, cfg):
+        decision = R3Router(cfg).route(
+            symbol="BTC/USDT:USDT",
+            timestamp=datetime(2026, 1, 1, 5, tzinfo=timezone.utc),
+            regime_state=_manual_regime_state(
+                regime=Regime.B_SIDEWAYS,
+                direction=Direction.NEUTRAL.value,
+            ),
+            trend_signal_result=SimpleNamespace(approved=True, direction="long"),
+            mean_reversion_signal_result=SimpleNamespace(approved=True, direction="short"),
+        )
+        assert decision.approved is True
+        assert decision.selected_strategy == "mean_reversion"
+
+    def test_regime_c_deferred(self, cfg):
+        decision = R3Router(cfg).route(
+            symbol="BTC/USDT:USDT",
+            timestamp=datetime(2026, 1, 1, 5, tzinfo=timezone.utc),
+            regime_state=_manual_regime_state(regime=Regime.C_FUNDING_EXTREME, direction="contrarian_short"),
+        )
+        assert decision.approved is False
+        assert decision.deferred is True
+        assert "REGIME_C_DEFERRED" in decision.reason_codes
+
+    def test_unknown_rejects(self, cfg):
+        decision = R3Router(cfg).route(
+            symbol="BTC/USDT:USDT",
+            timestamp=datetime(2026, 1, 1, 5, tzinfo=timezone.utc),
+            regime_state=_manual_regime_state(regime=Regime.UNKNOWN, direction="none"),
+        )
+        assert decision.approved is False
+        assert "REJECT_REGIME_UNKNOWN" in decision.rejection_reasons
+
+    def test_existing_short_rejects_long(self, cfg):
+        decision = R3Router(cfg).route(
+            symbol="BTC/USDT:USDT",
+            timestamp=datetime(2026, 1, 1, 5, tzinfo=timezone.utc),
+            regime_state=_manual_regime_state(regime=Regime.A_TREND, direction="long"),
+            trend_signal_result=SimpleNamespace(approved=True, direction="long"),
+            existing_position_state=PositionState(
+                symbol="BTC/USDT:USDT",
+                has_position=True,
+                direction="short",
+            ),
+        )
+        assert decision.approved is False
+        assert "REJECT_OPPOSITE_POSITION_EXISTS" in decision.rejection_reasons
+
+    def test_same_direction_position_conservatively_rejected(self, cfg):
+        decision = R3Router(cfg).route(
+            symbol="BTC/USDT:USDT",
+            timestamp=datetime(2026, 1, 1, 5, tzinfo=timezone.utc),
+            regime_state=_manual_regime_state(regime=Regime.A_TREND, direction="long"),
+            trend_signal_result=SimpleNamespace(approved=True, direction="long"),
+            existing_position_state=PositionState(
+                symbol="BTC/USDT:USDT",
+                has_position=True,
+                direction="long",
+            ),
+        )
+        assert decision.approved is False
+        assert "REJECT_POSITION_EXISTS" in decision.rejection_reasons
+
+    def test_router_does_not_mutate_position_state(self, cfg):
+        position = PositionState(
+            symbol="BTC/USDT:USDT",
+            has_position=True,
+            direction="long",
+            quantity=2.0,
+            entry_price=100.0,
+        )
+        before = position
+        R3Router(cfg).route(
+            symbol="BTC/USDT:USDT",
+            timestamp=datetime(2026, 1, 1, 5, tzinfo=timezone.utc),
+            regime_state=_manual_regime_state(regime=Regime.A_TREND, direction="short"),
+            trend_signal_result=SimpleNamespace(approved=True, direction="short"),
+            existing_position_state=position,
+        )
+        assert position == before
+
+    def test_router_does_not_call_exchange_order_api(self):
+        from pathlib import Path
+        src = Path(__file__).resolve().parents[1] / "strategies" / "r3" / "router.py"
+        text = src.read_text(encoding="utf-8")
+        for forbidden in ["create_order", "place_order", "market_order", "ccxt"]:
+            assert forbidden not in text
+
+
+class TestSprint4Regression:
+    def test_no_forbidden_sprint4_implementations(self):
+        from pathlib import Path
+        root = Path(__file__).resolve().parents[1] / "strategies" / "r3"
+        checked = [
+            root / "mean_reversion.py",
+            root / "router.py",
+            root / "confirmation.py",
+            root / "executor.py",
+            root / "risk_engine.py",
+            root / "trailing.py",
+        ]
+        for path in checked:
+            text = path.read_text(encoding="utf-8")
+            text = text.replace("live_order_type", "")
+            for forbidden in [
+                "BacktestEngine",
+                "create_order",
+                "place_order",
+                "market_order",
+                "ccxt",
+                "funding_reversal",
+                "live",
+            ]:
+                assert forbidden not in text
 
 
 UTC = timezone.utc

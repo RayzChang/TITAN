@@ -250,12 +250,33 @@ mean_reversion:
     close_position_in_range_min: 0.6
     rsi_oversold: 30
     rsi_overbought: 70
+    patterns:
+      engulfing_body_growth_min: 1.1
+      hammer_body_max_ratio: 0.3
+      hammer_shadow_ratio_min: 2.0
+      hammer_upper_shadow_max_ratio: 0.3
+      shooting_star_body_max_ratio: 0.3
+      shooting_star_shadow_ratio_min: 2.0
+      shooting_star_lower_shadow_max_ratio: 0.3
+
+  entry_order:
+    mode: "limit_maker_mean_reversion"
+    order_type: "LIMIT_MAKER"
+    time_in_force: "GTX"
+    timeout_5m_bars: 2
+    chase_allowed: false
+    quantity_basis: "limit_price"
 
   # ----- 出場 -----
   exit:
     tp_target: ["bollinger_middle", "vwap"]    # 任一觸及
+    sl_atr_mult: 1.0
     sl_atr_mult_min: 0.8
     sl_atr_mult_max: 1.2
+    target_exit_pct: 100
+    secondary_exit_pct: 0
+    breakeven_trigger_r: 0
+    trailing_trigger_r: 0
     time_stop_hours: 12
 
   cooldown_after:
