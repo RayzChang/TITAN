@@ -286,3 +286,103 @@ class MeanReversionStopExitBuilder:
         if direction == "long":
             return min(value for _, value in values), "CONSERVATIVE_TARGET"
         return max(value for _, value in values), "CONSERVATIVE_TARGET"
+
+
+class FundingReversalStopExitBuilder:
+    """Build data-only stop and exit plans for Funding Reversal."""
+
+    strategy_name = "funding_reversal"
+
+    def __init__(self, cfg: R3Config):
+        self.cfg = cfg
+        exit_cfg = cfg.funding_reversal.exit
+        self.stop_atr_mult = float(exit_cfg.sl_atr_mult)
+        self.stop_atr_mult_min = float(exit_cfg.sl_atr_mult_min)
+        self.stop_atr_mult_max = float(exit_cfg.sl_atr_mult_max)
+        self.target_exit_fraction = float(exit_cfg.target_exit_pct) / 100.0
+        self.secondary_exit_fraction = float(exit_cfg.secondary_exit_pct) / 100.0
+        self.breakeven_trigger_r = float(exit_cfg.breakeven_trigger_r)
+        self.trailing_trigger_r = float(exit_cfg.trailing_trigger_r)
+        self.time_stop_hours = float(exit_cfg.time_stop_hours)
+
+    def build_stop_plan(
+        self,
+        symbol: str,
+        direction: str,
+        entry_price: float,
+        atr_1h: float,
+    ) -> StopPlan:
+        if direction not in {"long", "short"}:
+            raise ValueError(f"Invalid direction: {direction}")
+        if entry_price <= 0:
+            raise ValueError("entry_price must be positive")
+        if atr_1h <= 0:
+            raise ValueError("atr_1h must be positive")
+
+        if direction == "long":
+            stop_price = entry_price - self.stop_atr_mult * atr_1h
+        else:
+            stop_price = entry_price + self.stop_atr_mult * atr_1h
+
+        return StopPlan(
+            symbol=symbol,
+            direction=direction,
+            entry_price=float(entry_price),
+            stop_price=float(stop_price),
+            stop_source="ATR_FR",
+            risk_per_unit=float(abs(entry_price - stop_price)),
+            reason_codes=["FR_STOP_FROM_ATR"],
+            metrics_snapshot={
+                "atr_1h": float(atr_1h),
+                "sl_atr_mult": self.stop_atr_mult,
+                "sl_atr_mult_min": self.stop_atr_mult_min,
+                "sl_atr_mult_max": self.stop_atr_mult_max,
+            },
+            strategy_name=self.strategy_name,
+        )
+
+    def build_exit_plan(
+        self,
+        symbol: str,
+        direction: str,
+        entry_price: float,
+        stop_price: float,
+        vwap: float | None,
+        mark_price: float | None = None,
+    ) -> ExitPlan:
+        if direction not in {"long", "short"}:
+            raise ValueError(f"Invalid direction: {direction}")
+        if entry_price <= 0 or stop_price <= 0:
+            raise ValueError("entry_price and stop_price must be positive")
+
+        target, source = self._target(vwap, mark_price)
+        risk_per_unit = abs(entry_price - stop_price)
+        return ExitPlan(
+            symbol=symbol,
+            direction=direction,
+            entry_price=float(entry_price),
+            stop_price=float(stop_price),
+            risk_per_unit=float(risk_per_unit),
+            tp1_price=float(target),
+            tp1_fraction=float(self.target_exit_fraction),
+            tp2_price=float(target),
+            tp2_fraction=float(self.secondary_exit_fraction),
+            breakeven_trigger_r=self.breakeven_trigger_r,
+            trailing_trigger_r=self.trailing_trigger_r,
+            reason_codes=["FR_TARGET_PLAN", "FR_TIME_STOP_PLAN"],
+            metrics_snapshot={
+                "vwap": vwap,
+                "mark_price": mark_price,
+                "time_stop_hours": self.time_stop_hours,
+            },
+            strategy_name=self.strategy_name,
+            target_source=source,
+            time_stop_hours=self.time_stop_hours,
+        )
+
+    def _target(self, vwap: float | None, mark_price: float | None) -> tuple[float, str]:
+        if vwap is not None:
+            return float(vwap), "VWAP"
+        if mark_price is not None:
+            return float(mark_price), "MARK_PRICE"
+        raise ValueError("At least one funding reversal target is required")

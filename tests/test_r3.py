@@ -27,7 +27,11 @@ import pytest
 
 from strategies.r3.config_loader import R3Config
 from strategies.r3 import indicators as ind
-from strategies.r3.confirmation import MeanReversionConfirmation5M, TrendConfirmation5M
+from strategies.r3.confirmation import (
+    FundingReversalConfirmation5M,
+    MeanReversionConfirmation5M,
+    TrendConfirmation5M,
+)
 from strategies.r3.data_loader import (
     R3DataLoader,
     IntegrityReport,
@@ -38,17 +42,27 @@ from strategies.r3.data_loader import (
     TIMEFRAME_TO_SECONDS,
 )
 from strategies.r3.executor import (
+    FundingReversalOrderIntentBuilder,
     MeanReversionOrderIntentBuilder,
     OrderIntent,
     PartialFillSimulator,
     TrendOrderIntentBuilder,
 )
 from strategies.r3.exchange import R3ExchangeData
+from strategies.r3.funding_reversal import (
+    FundingReversalStrategy,
+    evaluate_funding_reversal_setup,
+    evaluate_no_new_high_low,
+)
 from strategies.r3.mean_reversion import MeanReversionStrategy
 from strategies.r3.regime import Direction, Regime, RegimeState
 from strategies.r3.risk_engine import RiskEngine
 from strategies.r3.router import CooldownState, PositionState, R3Router
-from strategies.r3.trailing import MeanReversionStopExitBuilder, TrendStopExitBuilder
+from strategies.r3.trailing import (
+    FundingReversalStopExitBuilder,
+    MeanReversionStopExitBuilder,
+    TrendStopExitBuilder,
+)
 from strategies.r3.trend_pullback import (
     TrendPullbackStrategy,
     evaluate_pullback_zone,
@@ -197,12 +211,77 @@ def _mr_1h_df(direction: str = "long") -> pd.DataFrame:
     }, index=idx)
 
 
+def _fr_5m_df(direction: str = "long", only_one_condition: bool = False) -> pd.DataFrame:
+    idx = pd.date_range(datetime(2026, 1, 1, 4, 35, tzinfo=timezone.utc), periods=15, freq="5min")
+    opens = [100.0] * 15
+    highs = [101.0] * 15
+    lows = [99.0] * 15
+    closes = [100.0] * 15
+    rsi_values = [50.0] * 15
+    if direction == "long":
+        opens[-2:] = [99.0, 98.0]
+        highs[-2:] = [100.0, 100.0]
+        lows[-2:] = [97.0, 95.0]
+        closes[-2:] = [98.0, 98.5]
+        rsi_values[-2:] = [33.0, 34.0]
+        if only_one_condition:
+            opens[-1] = 98.1
+            highs[-1] = 99.0
+            lows[-1] = 98.0
+            closes[-1] = 98.8
+            rsi_values[-2:] = [40.0, 39.0]
+    else:
+        opens[-2:] = [101.0, 102.0]
+        highs[-2:] = [103.0, 105.0]
+        lows[-2:] = [100.0, 100.0]
+        closes[-2:] = [102.0, 101.5]
+        rsi_values[-2:] = [66.0, 65.5]
+        if only_one_condition:
+            rsi_values[-2:] = [60.0, 61.0]
+    return pd.DataFrame({
+        "open": opens,
+        "high": highs,
+        "low": lows,
+        "close": closes,
+        "volume": [100.0] * len(closes),
+        "rsi_14": rsi_values,
+        "atr_14": [0.5] * len(closes),
+    }, index=idx)
+
+
+def _fr_1h_df(direction: str = "short") -> pd.DataFrame:
+    idx = pd.date_range(datetime(2026, 1, 1, 0, tzinfo=timezone.utc), periods=6, freq="1h")
+    if direction == "short":
+        highs = [101.0, 103.0, 105.0, 104.0, 103.0, 104.5]
+        lows = [99.0, 101.0, 103.0, 102.0, 101.0, 102.5]
+        closes = [100.0, 102.0, 104.0, 103.0, 102.0, 103.5]
+        rsi_values = [68.0, 72.0, 74.0, 76.0, 77.0, 78.0]
+        vwap_values = [101.0] * 6
+    else:
+        highs = [101.0, 99.0, 97.0, 98.0, 99.0, 97.5]
+        lows = [99.0, 97.0, 95.0, 96.0, 97.0, 95.5]
+        closes = [100.0, 98.0, 96.0, 97.0, 98.0, 96.5]
+        rsi_values = [32.0, 28.0, 26.0, 24.0, 23.0, 22.0]
+        vwap_values = [99.0] * 6
+    return pd.DataFrame({
+        "open": closes,
+        "high": highs,
+        "low": lows,
+        "close": closes,
+        "volume": [100.0] * 6,
+        "vwap": vwap_values,
+        "rsi_14": rsi_values,
+        "atr_14": [2.0] * 6,
+    }, index=idx)
+
+
 def _manual_regime_state(
     *,
     regime: Regime = Regime.A_TREND,
     direction: str = Direction.LONG.value,
     allow_new_entries: bool = True,
     funding_z: float = 0.5,
+    premium_z: float = 0.5,
     extreme_vol: bool = False,
 ) -> RegimeState:
     ema_short = 100.0 if direction == Direction.LONG.value else 90.0
@@ -220,6 +299,7 @@ def _manual_regime_state(
             "ema_4h_long": ema_long,
             "adx_4h": 30.0,
             "funding_z": funding_z,
+            "premium_z": premium_z,
             "extreme_vol": extreme_vol,
         },
     )
@@ -490,6 +570,79 @@ class TestQ25MRConfirmation:
         assert result.metrics_snapshot["current_rsi"] == pytest.approx(71.0)
         assert result.metrics_snapshot["previous_rsi"] == pytest.approx(72.0)
         assert "MR_RSI_REVERSAL_SHORT" in result.conditions_passed
+
+
+class TestSprint5FRConfirmation:
+    def test_config_values_match_spec(self, cfg):
+        c = cfg.funding_reversal.confirmation_5m
+        assert c.rule == "two_of_three"
+        assert c.close_position_in_range_min == pytest.approx(0.6)
+        assert c.rsi_oversold == pytest.approx(35)
+        assert c.rsi_overbought == pytest.approx(65)
+
+    def test_does_not_use_breakout_signal(self, cfg):
+        long_signals = list(cfg.funding_reversal.confirmation_5m.long_signals)
+        short_signals = list(cfg.funding_reversal.confirmation_5m.short_signals)
+        signals = long_signals + short_signals
+        assert all("breakout" not in s.lower() and "breaks_previous" not in s.lower()
+                   for s in signals)
+
+    def test_fr_long_two_of_three_should_qualify(self, cfg):
+        df = _fr_5m_df("long")
+        result = FundingReversalConfirmation5M(cfg).check_long(
+            df,
+            df.index[-1],
+            "BTC/USDT:USDT",
+        )
+        assert result.passed is True
+        assert result.strategy_name == "funding_reversal"
+        assert "FR_BULLISH_CLOSE" in result.conditions_passed
+        assert "FR_RSI_REVERSAL_LONG" in result.conditions_passed
+        assert "FR_CONFIRMATION_PASSED" in result.reason_codes
+
+    def test_fr_short_two_of_three_should_qualify(self, cfg):
+        df = _fr_5m_df("short")
+        result = FundingReversalConfirmation5M(cfg).check_short(
+            df,
+            df.index[-1],
+            "BTC/USDT:USDT",
+        )
+        assert result.passed is True
+        assert "FR_BEARISH_CLOSE" in result.conditions_passed
+        assert "FR_RSI_REVERSAL_SHORT" in result.conditions_passed
+
+    def test_only_one_condition_should_not_qualify(self, cfg):
+        df = _fr_5m_df("long", only_one_condition=True)
+        result = FundingReversalConfirmation5M(cfg).check_long(
+            df,
+            df.index[-1],
+            "BTC/USDT:USDT",
+        )
+        assert result.passed is False
+        assert result.conditions_passed == ["FR_BULLISH_CLOSE"]
+        assert "FR_CONFIRMATION_FAILED" in result.reason_codes
+
+    def test_fr_rsi_reversal_long_correct(self, cfg):
+        df = _fr_5m_df("long")
+        result = FundingReversalConfirmation5M(cfg).check_long(
+            df,
+            df.index[-1],
+            "BTC/USDT:USDT",
+        )
+        assert result.metrics_snapshot["current_rsi"] == pytest.approx(34.0)
+        assert result.metrics_snapshot["previous_rsi"] == pytest.approx(33.0)
+        assert "FR_RSI_REVERSAL_LONG" in result.conditions_passed
+
+    def test_fr_rsi_reversal_short_correct(self, cfg):
+        df = _fr_5m_df("short")
+        result = FundingReversalConfirmation5M(cfg).check_short(
+            df,
+            df.index[-1],
+            "BTC/USDT:USDT",
+        )
+        assert result.metrics_snapshot["current_rsi"] == pytest.approx(65.5)
+        assert result.metrics_snapshot["previous_rsi"] == pytest.approx(66.0)
+        assert "FR_RSI_REVERSAL_SHORT" in result.conditions_passed
 
 
 # ===============================================================
@@ -1254,15 +1407,15 @@ class TestSprint4RouterV1:
         assert decision.approved is True
         assert decision.selected_strategy == "mean_reversion"
 
-    def test_regime_c_deferred(self, cfg):
+    def test_regime_c_requires_funding_reversal_signal(self, cfg):
         decision = R3Router(cfg).route(
             symbol="BTC/USDT:USDT",
             timestamp=datetime(2026, 1, 1, 5, tzinfo=timezone.utc),
             regime_state=_manual_regime_state(regime=Regime.C_FUNDING_EXTREME, direction="contrarian_short"),
         )
         assert decision.approved is False
-        assert decision.deferred is True
-        assert "REGIME_C_DEFERRED" in decision.reason_codes
+        assert decision.selected_strategy == "funding_reversal"
+        assert "NO_APPROVED_FUNDING_REVERSAL_SIGNAL" in decision.rejection_reasons
 
     def test_unknown_rejects(self, cfg):
         decision = R3Router(cfg).route(
@@ -1329,6 +1482,369 @@ class TestSprint4RouterV1:
             assert forbidden not in text
 
 
+class TestSprint5NoNewHighLow:
+    def test_short_no_new_high_confirmed(self, cfg):
+        result = evaluate_no_new_high_low(_fr_1h_df("short"), cfg, "short")
+        assert result.passed is True
+        assert "NO_NEW_HIGH_CONFIRMED" in result.reason_codes
+
+    def test_short_new_high_rejected(self, cfg):
+        df = _fr_1h_df("short")
+        df.loc[df.index[-1], "high"] = 106.0
+        result = evaluate_no_new_high_low(df, cfg, "short")
+        assert result.passed is False
+        assert "NEW_HIGH_STILL_FORMING" in result.rejection_reasons
+
+    def test_long_no_new_low_confirmed(self, cfg):
+        result = evaluate_no_new_high_low(_fr_1h_df("long"), cfg, "long")
+        assert result.passed is True
+        assert "NO_NEW_LOW_CONFIRMED" in result.reason_codes
+
+    def test_long_new_low_rejected(self, cfg):
+        df = _fr_1h_df("long")
+        df.loc[df.index[-1], "low"] = 94.0
+        result = evaluate_no_new_high_low(df, cfg, "long")
+        assert result.passed is False
+        assert "NEW_LOW_STILL_FORMING" in result.rejection_reasons
+
+    def test_insufficient_structure_data_rejected(self, cfg):
+        result = evaluate_no_new_high_low(_fr_1h_df("short").iloc[-5:], cfg, "short")
+        assert result.passed is False
+        assert "INSUFFICIENT_STRUCTURE_DATA" in result.rejection_reasons
+
+
+class TestSprint5FundingReversalStrategy:
+    def test_regime_c_positive_extreme_approves_short(self, cfg):
+        as_of = datetime(2026, 1, 1, 5, 45, tzinfo=timezone.utc)
+        result = FundingReversalStrategy(cfg).evaluate(
+            symbol="BTC/USDT:USDT",
+            as_of=as_of,
+            regime_state=_manual_regime_state(
+                regime=Regime.C_FUNDING_EXTREME,
+                direction=Direction.CONTRARIAN_SHORT.value,
+                funding_z=2.5,
+                premium_z=2.0,
+            ),
+            df_1h=_fr_1h_df("short"),
+            df_5m=_fr_5m_df("short"),
+            equity=5000.0,
+            current_bid=103.5,
+            current_ask=103.6,
+            tick_size=0.01,
+        )
+        assert result.approved is True
+        assert result.strategy_name == "funding_reversal"
+        assert result.direction == "short"
+        assert result.confirmation_result.strategy_name == "funding_reversal"
+        assert result.risk_plan is not None
+        assert result.stop_plan.strategy_name == "funding_reversal"
+        assert result.exit_plan.strategy_name == "funding_reversal"
+        assert result.entry_order_intent is not None
+
+    def test_regime_c_negative_extreme_approves_long(self, cfg):
+        as_of = datetime(2026, 1, 1, 5, 45, tzinfo=timezone.utc)
+        result = FundingReversalStrategy(cfg).evaluate(
+            symbol="BTC/USDT:USDT",
+            as_of=as_of,
+            regime_state=_manual_regime_state(
+                regime=Regime.C_FUNDING_EXTREME,
+                direction=Direction.CONTRARIAN_LONG.value,
+                funding_z=-2.5,
+                premium_z=-2.0,
+            ),
+            df_1h=_fr_1h_df("long"),
+            df_5m=_fr_5m_df("long"),
+            equity=5000.0,
+            current_bid=96.5,
+            current_ask=96.6,
+            tick_size=0.01,
+        )
+        assert result.approved is True
+        assert result.direction == "long"
+        assert result.entry_order_intent.limit_price == pytest.approx(96.49)
+
+    @pytest.mark.parametrize(
+        "regime,direction",
+        [
+            (Regime.A_TREND, Direction.CONTRARIAN_SHORT.value),
+            (Regime.B_SIDEWAYS, Direction.CONTRARIAN_SHORT.value),
+            (Regime.D_NO_TRADE, Direction.NONE.value),
+            (Regime.UNKNOWN, Direction.NONE.value),
+        ],
+    )
+    def test_non_c_regimes_reject(self, cfg, regime, direction):
+        result = FundingReversalStrategy(cfg).evaluate(
+            symbol="BTC/USDT:USDT",
+            as_of=datetime(2026, 1, 1, 5, 45, tzinfo=timezone.utc),
+            regime_state=_manual_regime_state(
+                regime=regime,
+                direction=direction,
+                funding_z=2.5,
+                premium_z=2.0,
+            ),
+            df_1h=_fr_1h_df("short"),
+            df_5m=_fr_5m_df("short"),
+            equity=5000.0,
+            current_bid=103.5,
+            current_ask=103.6,
+            tick_size=0.01,
+        )
+        assert result.approved is False
+        assert "REGIME_NOT_C" in result.rejection_reasons
+
+    def test_funding_or_premium_not_extreme_rejects(self, cfg):
+        result = FundingReversalStrategy(cfg).evaluate(
+            symbol="BTC/USDT:USDT",
+            as_of=datetime(2026, 1, 1, 5, 45, tzinfo=timezone.utc),
+            regime_state=_manual_regime_state(
+                regime=Regime.C_FUNDING_EXTREME,
+                direction=Direction.CONTRARIAN_SHORT.value,
+                funding_z=2.4,
+                premium_z=2.0,
+            ),
+            df_1h=_fr_1h_df("short"),
+            df_5m=_fr_5m_df("short"),
+            equity=5000.0,
+            current_bid=103.5,
+            current_ask=103.6,
+            tick_size=0.01,
+        )
+        assert result.approved is False
+        assert "FUNDING_PREMIUM_NOT_POSITIVE_EXTREME" in result.rejection_reasons
+
+    def test_funding_premium_mismatch_rejects(self, cfg):
+        result = evaluate_funding_reversal_setup(
+            _fr_1h_df("short"),
+            cfg,
+            funding_z=2.6,
+            premium_z=-2.1,
+            regime_direction=Direction.CONTRARIAN_SHORT.value,
+        )
+        assert result.passed is False
+        assert "FUNDING_PREMIUM_NOT_POSITIVE_EXTREME" in result.rejection_reasons
+
+    def test_extreme_vol_rejects(self, cfg):
+        result = FundingReversalStrategy(cfg).evaluate(
+            symbol="BTC/USDT:USDT",
+            as_of=datetime(2026, 1, 1, 5, 45, tzinfo=timezone.utc),
+            regime_state=_manual_regime_state(
+                regime=Regime.C_FUNDING_EXTREME,
+                direction=Direction.CONTRARIAN_SHORT.value,
+                funding_z=2.5,
+                premium_z=2.0,
+                extreme_vol=True,
+            ),
+            df_1h=_fr_1h_df("short"),
+            df_5m=_fr_5m_df("short"),
+            equity=5000.0,
+            current_bid=103.5,
+            current_ask=103.6,
+            tick_size=0.01,
+        )
+        assert result.approved is False
+        assert "EXTREME_VOL" in result.rejection_reasons
+
+    def test_allow_new_entries_false_rejects(self, cfg):
+        result = FundingReversalStrategy(cfg).evaluate(
+            symbol="BTC/USDT:USDT",
+            as_of=datetime(2026, 1, 1, 5, 45, tzinfo=timezone.utc),
+            regime_state=_manual_regime_state(
+                regime=Regime.C_FUNDING_EXTREME,
+                direction=Direction.CONTRARIAN_SHORT.value,
+                allow_new_entries=False,
+                funding_z=2.5,
+                premium_z=2.0,
+            ),
+            df_1h=_fr_1h_df("short"),
+            df_5m=_fr_5m_df("short"),
+            equity=5000.0,
+            current_bid=103.5,
+            current_ask=103.6,
+            tick_size=0.01,
+        )
+        assert result.approved is False
+        assert "ALLOW_NEW_ENTRIES_FALSE" in result.rejection_reasons
+
+    def test_fr_cannot_use_trend_breakout_confirmation(self, cfg):
+        df = _fr_5m_df("long", only_one_condition=True)
+        df.loc[df.index[-1], "open"] = 109.0
+        df.loc[df.index[-1], "high"] = 111.0
+        df.loc[df.index[-1], "low"] = 108.0
+        df.loc[df.index[-1], "close"] = 110.0
+        result = FundingReversalConfirmation5M(cfg).check_long(
+            df,
+            df.index[-1],
+            "BTC/USDT:USDT",
+        )
+        assert result.passed is False
+        assert all("BREAK" not in code.upper() for code in result.conditions_passed)
+
+
+class TestSprint5FRStopExitExecutor:
+    def test_long_stop_uses_fr_atr_multiplier(self, cfg):
+        stop = FundingReversalStopExitBuilder(cfg).build_stop_plan(
+            symbol="BTC/USDT:USDT",
+            direction="long",
+            entry_price=100.0,
+            atr_1h=2.0,
+        )
+        assert cfg.funding_reversal.exit.sl_atr_mult == pytest.approx(1.2)
+        assert stop.stop_source == "ATR_FR"
+        assert stop.stop_price == pytest.approx(97.6)
+
+    def test_short_stop_uses_fr_atr_multiplier(self, cfg):
+        stop = FundingReversalStopExitBuilder(cfg).build_stop_plan(
+            symbol="BTC/USDT:USDT",
+            direction="short",
+            entry_price=100.0,
+            atr_1h=2.0,
+        )
+        assert stop.stop_source == "ATR_FR"
+        assert stop.stop_price == pytest.approx(102.4)
+
+    def test_target_uses_vwap_and_time_stop(self, cfg):
+        plan = FundingReversalStopExitBuilder(cfg).build_exit_plan(
+            symbol="BTC/USDT:USDT",
+            direction="short",
+            entry_price=105.0,
+            stop_price=107.4,
+            vwap=101.0,
+        )
+        assert plan.tp1_price == pytest.approx(101.0)
+        assert plan.target_source == "VWAP"
+        assert plan.time_stop_hours == pytest.approx(12.0)
+
+    def test_long_fr_limit_price(self, cfg):
+        price = FundingReversalOrderIntentBuilder(cfg).compute_limit_price(
+            direction="long",
+            current_bid=96.5,
+            current_ask=96.6,
+            tick_size=0.01,
+            signal_5m_close=98.5,
+        )
+        assert price == pytest.approx(96.49)
+
+    def test_short_fr_limit_price(self, cfg):
+        price = FundingReversalOrderIntentBuilder(cfg).compute_limit_price(
+            direction="short",
+            current_bid=103.5,
+            current_ask=103.6,
+            tick_size=0.01,
+            signal_5m_close=101.5,
+        )
+        assert price == pytest.approx(103.61)
+
+    def test_fr_order_intent_expires_after_10_minutes(self, cfg):
+        ts = datetime(2026, 1, 1, 5, 45, tzinfo=timezone.utc)
+        intent = FundingReversalOrderIntentBuilder(cfg).build_entry_intent(
+            symbol="BTC/USDT:USDT",
+            direction="short",
+            signal_timestamp=ts,
+            current_bid=103.5,
+            current_ask=103.6,
+            tick_size=0.01,
+            signal_5m_close=101.5,
+            quantity=1.0,
+            signal_id="fr-sig-1",
+        )
+        assert intent.expires_at == ts + timedelta(minutes=10)
+        assert intent.reduce_only is False
+        assert intent.reason_codes == ["FUNDING_REVERSAL_MAKER_LIMIT_INTENT"]
+
+
+class TestSprint5RouterRegimeC:
+    def test_regime_c_only_allows_funding_reversal(self, cfg):
+        funding_signal = SimpleNamespace(approved=True, direction="short", strategy_name="funding_reversal")
+        decision = R3Router(cfg).route(
+            symbol="BTC/USDT:USDT",
+            timestamp=datetime(2026, 1, 1, 5, tzinfo=timezone.utc),
+            regime_state=_manual_regime_state(
+                regime=Regime.C_FUNDING_EXTREME,
+                direction=Direction.CONTRARIAN_SHORT.value,
+            ),
+            trend_signal_result=SimpleNamespace(approved=True, direction="long"),
+            mean_reversion_signal_result=SimpleNamespace(approved=True, direction="long"),
+            funding_reversal_signal_result=funding_signal,
+        )
+        assert decision.approved is True
+        assert decision.selected_strategy == "funding_reversal"
+        assert decision.signal_result is funding_signal
+        assert "ROUTER_ALLOW_FUNDING_REVERSAL" in decision.reason_codes
+
+    def test_regime_c_rejected_funding_signal_does_not_open(self, cfg):
+        decision = R3Router(cfg).route(
+            symbol="BTC/USDT:USDT",
+            timestamp=datetime(2026, 1, 1, 5, tzinfo=timezone.utc),
+            regime_state=_manual_regime_state(
+                regime=Regime.C_FUNDING_EXTREME,
+                direction=Direction.CONTRARIAN_SHORT.value,
+            ),
+            trend_signal_result=SimpleNamespace(approved=True, direction="long"),
+            mean_reversion_signal_result=SimpleNamespace(approved=True, direction="long"),
+            funding_reversal_signal_result=SimpleNamespace(approved=False, direction="short"),
+        )
+        assert decision.approved is False
+        assert decision.selected_strategy == "funding_reversal"
+        assert "NO_APPROVED_FUNDING_REVERSAL_SIGNAL" in decision.rejection_reasons
+
+    def test_existing_long_rejects_fr_short(self, cfg):
+        decision = R3Router(cfg).route(
+            symbol="BTC/USDT:USDT",
+            timestamp=datetime(2026, 1, 1, 5, tzinfo=timezone.utc),
+            regime_state=_manual_regime_state(
+                regime=Regime.C_FUNDING_EXTREME,
+                direction=Direction.CONTRARIAN_SHORT.value,
+            ),
+            funding_reversal_signal_result=SimpleNamespace(approved=True, direction="short"),
+            existing_position_state=PositionState(
+                symbol="BTC/USDT:USDT",
+                has_position=True,
+                direction="long",
+            ),
+        )
+        assert decision.approved is False
+        assert "REJECT_OPPOSITE_POSITION_EXISTS" in decision.rejection_reasons
+
+    def test_existing_short_rejects_fr_long(self, cfg):
+        decision = R3Router(cfg).route(
+            symbol="BTC/USDT:USDT",
+            timestamp=datetime(2026, 1, 1, 5, tzinfo=timezone.utc),
+            regime_state=_manual_regime_state(
+                regime=Regime.C_FUNDING_EXTREME,
+                direction=Direction.CONTRARIAN_LONG.value,
+            ),
+            funding_reversal_signal_result=SimpleNamespace(approved=True, direction="long"),
+            existing_position_state=PositionState(
+                symbol="BTC/USDT:USDT",
+                has_position=True,
+                direction="short",
+            ),
+        )
+        assert decision.approved is False
+        assert "REJECT_OPPOSITE_POSITION_EXISTS" in decision.rejection_reasons
+
+    def test_router_does_not_mutate_position_state_for_fr(self, cfg):
+        position = PositionState(
+            symbol="BTC/USDT:USDT",
+            has_position=True,
+            direction="long",
+            quantity=2.0,
+            entry_price=100.0,
+        )
+        before = position
+        R3Router(cfg).route(
+            symbol="BTC/USDT:USDT",
+            timestamp=datetime(2026, 1, 1, 5, tzinfo=timezone.utc),
+            regime_state=_manual_regime_state(
+                regime=Regime.C_FUNDING_EXTREME,
+                direction=Direction.CONTRARIAN_SHORT.value,
+            ),
+            funding_reversal_signal_result=SimpleNamespace(approved=True, direction="short"),
+            existing_position_state=position,
+        )
+        assert position == before
+
+
 class TestSprint4Regression:
     def test_no_forbidden_sprint4_implementations(self):
         from pathlib import Path
@@ -1350,7 +1866,44 @@ class TestSprint4Regression:
                 "place_order",
                 "market_order",
                 "ccxt",
-                "funding_reversal",
+                "live",
+            ]:
+                assert forbidden not in text
+
+
+class TestSprint5Regression:
+    def test_no_forbidden_sprint5_implementations(self):
+        import re
+        from pathlib import Path
+        root = Path(__file__).resolve().parents[1] / "strategies" / "r3"
+        checked = [
+            root / "funding_reversal.py",
+            root / "router.py",
+            root / "confirmation.py",
+            root / "executor.py",
+            root / "risk_engine.py",
+            root / "trailing.py",
+        ]
+        for path in checked:
+            text = path.read_text(encoding="utf-8")
+            text = re.sub(r'(?s)"""(?:.*?)"""|\'\'\'(?:.*?)\'\'\'', "", text)
+            text = text.replace("live_order_type", "")
+            for forbidden in [
+                "BacktestEngine",
+                "create_order",
+                "place_order",
+                "market_order",
+                "ccxt",
+                "validation",
+                "L0",
+                "L1",
+                "L2",
+                "L3",
+                "L4",
+                "L5",
+                "L6",
+                "Sprint 6",
+                "Sprint-6",
                 "live",
             ]:
                 assert forbidden not in text

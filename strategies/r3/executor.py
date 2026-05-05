@@ -184,6 +184,69 @@ class MeanReversionOrderIntentBuilder:
         )
 
 
+class FundingReversalOrderIntentBuilder:
+    """Build Funding Reversal maker-limit intents without chasing price."""
+
+    def __init__(self, cfg: R3Config):
+        self.cfg = cfg
+        entry_cfg = cfg.funding_reversal.entry_order
+        self.order_type = str(entry_cfg.order_type)
+        self.time_in_force = str(entry_cfg.time_in_force)
+        self.timeout_5m_bars = int(entry_cfg.timeout_5m_bars)
+        self.execution_timeframe = str(cfg.timeframes.execution)
+
+    def compute_limit_price(
+        self,
+        *,
+        direction: str,
+        current_bid: float,
+        current_ask: float,
+        tick_size: float,
+        signal_5m_close: float,
+    ) -> float:
+        if direction == "long":
+            return float(min(current_bid - tick_size, signal_5m_close))
+        if direction == "short":
+            return float(max(current_ask + tick_size, signal_5m_close))
+        raise ValueError(f"Invalid direction: {direction}")
+
+    def build_entry_intent(
+        self,
+        *,
+        symbol: str,
+        direction: str,
+        signal_timestamp: datetime,
+        current_bid: float,
+        current_ask: float,
+        tick_size: float,
+        signal_5m_close: float,
+        quantity: float,
+        signal_id: str,
+    ) -> OrderIntent:
+        limit_price = self.compute_limit_price(
+            direction=direction,
+            current_bid=current_bid,
+            current_ask=current_ask,
+            tick_size=tick_size,
+            signal_5m_close=signal_5m_close,
+        )
+        expires_at = signal_timestamp + self.timeout_5m_bars * _timeframe_delta(
+            self.execution_timeframe
+        )
+        return OrderIntent(
+            symbol=symbol,
+            direction=direction,
+            order_type=self.order_type,
+            time_in_force=self.time_in_force,
+            limit_price=limit_price,
+            quantity=float(quantity),
+            reduce_only=False,
+            reason_codes=["FUNDING_REVERSAL_MAKER_LIMIT_INTENT"],
+            expires_at=expires_at,
+            signal_id=signal_id,
+        )
+
+
 class PartialFillSimulator:
     """Simulate Q27 partial-fill bookkeeping without touching real orders."""
 
