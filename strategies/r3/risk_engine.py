@@ -193,6 +193,7 @@ class RiskEngine:
         key_map = {
             "trend_pullback": "trend",
             "mean_reversion": "mean_reversion",
+            "funding_reversal": "funding_reversal",
         }
         key = key_map.get(strategy_name, strategy_name)
         data = cap_cfg.to_dict() if hasattr(cap_cfg, "to_dict") else {}

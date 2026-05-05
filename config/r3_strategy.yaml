@@ -293,9 +293,41 @@ funding_reversal:
     funding_z_threshold: 2.5
     premium_z_threshold: 2.0
     mark_index_divergence_min_bps: 15     # 0.0015
+    allow_extreme_vol: false
+    rsi_period: 14
     rsi_overbought: 75
     rsi_oversold: 25
     no_new_high_low_lookback_bars: 5      # Tier 3.3
+
+  confirmation_5m:
+    rule: "two_of_three"
+    long_signals:
+      - "close_in_upper_60_pct_of_range"
+      - "bullish_engulfing_or_hammer"
+      - "rsi_oversold_uptick"
+    short_signals:
+      - "close_in_lower_60_pct_of_range"
+      - "bearish_engulfing_or_shooting_star"
+      - "rsi_overbought_downtick"
+    close_position_in_range_min: 0.6
+    rsi_oversold: 35
+    rsi_overbought: 65
+    patterns:
+      engulfing_body_growth_min: 1.1
+      hammer_body_max_ratio: 0.3
+      hammer_shadow_ratio_min: 2.0
+      hammer_upper_shadow_max_ratio: 0.3
+      shooting_star_body_max_ratio: 0.3
+      shooting_star_shadow_ratio_min: 2.0
+      shooting_star_lower_shadow_max_ratio: 0.3
+
+  entry_order:
+    mode: "limit_maker_funding_reversal"
+    order_type: "LIMIT_MAKER"
+    time_in_force: "GTX"
+    timeout_5m_bars: 2
+    chase_allowed: false
+    quantity_basis: "limit_price"
 
   conflict_with_opposite_position:        # Q18
     action: "wait"
@@ -304,8 +336,13 @@ funding_reversal:
 
   exit:
     tp_target: ["mark_price", "vwap"]
+    sl_atr_mult: 1.2
     sl_atr_mult_min: 0.8
     sl_atr_mult_max: 1.5
+    target_exit_pct: 100
+    secondary_exit_pct: 0
+    breakeven_trigger_r: 0
+    trailing_trigger_r: 0
     time_stop_hours: 12
 
 # -------------------------------------------------------------
