@@ -518,6 +518,18 @@ pivot:
 # 12. 驗證體系 (§10)
 # -------------------------------------------------------------
 validation:
+  targets:
+    single_strategy_diagnostic:
+      - "trend_pullback_only"
+      - "mean_reversion_only"
+      - "funding_reversal_only"
+    full_portfolio_validation: "full_r3_portfolio"
+  reports:
+    output_root: "reports/validation/R3"
+  smoke:
+    lookback_days: 30
+    simulations: 10
+
   samples:
     is_research:        ["2021-01-01", "2023-12-31"]
     rolling_validation: ["2024-01-01", "2025-03-31"]
@@ -559,6 +571,7 @@ validation:
 
   l4_multiple_testing:
     bonferroni_alpha: 0.05
+    parameter_combinations_tested: 1
     pbo_via_cscv_max: 0.20
     dsr_min: 0.95
 
