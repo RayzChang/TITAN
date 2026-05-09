@@ -19,6 +19,7 @@ Config : config/r3_strategy.yaml
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -73,6 +74,30 @@ from strategies.r3.trend_pullback import (
     evaluate_rsi_rebound,
     evaluate_signal_window,
 )
+from strategies.r3.validation.common import (
+    ALLOWED_CONCLUSIONS,
+    CONCLUSION_APPROVED,
+    CONCLUSION_REJECTED,
+    CONCLUSION_SMOKE,
+    NOTE_SINGLE_STRATEGY_CANNOT_APPROVE,
+    NOTE_SINGLE_STRATEGY_DIAGNOSTIC,
+    STATUS_FAIL,
+    STATUS_PASS,
+    LevelResult,
+    ValidationContext,
+)
+from strategies.r3.validation.l0_backtest import evaluate_l0_pass
+from strategies.r3.validation.l1_walk_forward import aggregate_fold_metrics
+from strategies.r3.validation.l2_mcpt import mcpt_metrics
+from strategies.r3.validation.l3_bootstrap import BLOCK_SIZES, run_block_bootstrap
+from strategies.r3.validation.l4_bonferroni import bonferroni_correction
+from strategies.r3.validation.l5_oos import split_final_oos
+from strategies.r3.validation.l6_regime import MATRIX_COLUMNS, build_regime_strategy_matrix
+from strategies.r3.validation.reporting import write_validation_reports
+from strategies.r3.validation.target_metrics import target_artifacts
+from strategies.r3.validation.validator import R3Validator, expand_targets
+import strategies.r3.validation.l1_walk_forward as l1_module
+import strategies.r3.validation.validator as validator_module
 
 
 # ---------------------------------------------------------------
@@ -2446,6 +2471,498 @@ class TestSprint6Regression:
                 "FinalOOS",
                 "Sprint 7",
                 "Sprint-7",
+            ]:
+                assert forbidden not in text
+
+
+# ---------------------------------------------------------------
+# Sprint 7 - L0-L6 Validation Pipeline
+# ---------------------------------------------------------------
+class TestSprint7ValidationPipeline:
+    @staticmethod
+    def _level_result(level: str, status: str = STATUS_PASS) -> LevelResult:
+        return LevelResult(
+            target="full_r3_portfolio",
+            level=level,
+            test_name=f"{level}_test",
+            status=status,
+            passed=status == STATUS_PASS,
+            key_metrics={"level": level},
+            failure_reason="" if status == STATUS_PASS else "forced_failure",
+        )
+
+    @staticmethod
+    def _all_pass_runners():
+        return {
+            f"L{i}": (lambda level: (lambda context, target: LevelResult(
+                target=target,
+                level=level,
+                test_name=f"{level}_test",
+                status=STATUS_PASS,
+                passed=True,
+            )))(f"L{i}")
+            for i in range(7)
+        }
+
+    @staticmethod
+    def _fake_validation_backtest():
+        trade_log = pd.DataFrame({
+            "strategy_name": ["trend_pullback", "mean_reversion", "funding_reversal"],
+            "exit_timestamp": pd.to_datetime([
+                "2026-01-02T00:00:00Z",
+                "2026-01-03T00:00:00Z",
+                "2026-01-04T00:00:00Z",
+            ]),
+            "realized_pnl": [100.0, 50.0, -20.0],
+            "fee": [1.0, 1.0, 1.0],
+            "slippage": [0.2, 0.2, 0.2],
+            "funding_cost": [0.0, 0.0, 0.0],
+            "quantity": [1.0, 1.0, 1.0],
+            "risk_per_unit": [100.0, 100.0, 100.0],
+        })
+        equity_curve = pd.DataFrame({
+            "timestamp": pd.to_datetime([
+                "2026-01-01T00:00:00Z",
+                "2026-01-02T00:00:00Z",
+                "2026-01-03T00:00:00Z",
+                "2026-01-04T00:00:00Z",
+            ]),
+            "equity": [5000.0, 5099.0, 5148.0, 5127.0],
+        })
+        daily_pnl = pd.DataFrame({
+            "date": pd.to_datetime(["2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04"]).date,
+            "daily_pnl": [0.0, 99.0, 49.0, -21.0],
+        })
+        return SimpleNamespace(
+            trade_log=trade_log,
+            daily_pnl=daily_pnl,
+            equity_curve=equity_curve,
+            metrics={"total_trades": 3, "net_profit": 127.0},
+            data_warnings=[],
+        )
+
+    def test_validator_can_initialize(self, cfg):
+        validator = R3Validator(cfg)
+        assert validator.cfg is cfg
+
+    def test_diagnostic_mode_runs_all_levels_after_failure(self, cfg, tmp_path, monkeypatch):
+        calls = []
+
+        def make_runner(level: str, status: str):
+            def _runner(context, target):
+                calls.append(level)
+                return self._level_result(level, status)
+            return _runner
+
+        monkeypatch.setattr(
+            validator_module,
+            "LEVEL_RUNNERS",
+            {f"L{i}": make_runner(f"L{i}", STATUS_FAIL if i == 0 else STATUS_PASS) for i in range(7)},
+        )
+        result = R3Validator(cfg).run(
+            mode="diagnostic",
+            target="full_r3_portfolio",
+            symbols=["BTC/USDT:USDT"],
+            initial_capital=5000,
+            output_dir=tmp_path,
+            simulations=10,
+            seed=7,
+        )
+        assert calls == [f"L{i}" for i in range(7)]
+        assert len(result.target_results[0].level_results) == 7
+
+    def test_gated_mode_stops_on_first_failure(self, cfg, tmp_path, monkeypatch):
+        calls = []
+
+        def l0_runner(context, target):
+            calls.append("L0")
+            return self._level_result("L0", STATUS_FAIL)
+
+        def l1_runner(context, target):
+            calls.append("L1")
+            return self._level_result("L1", STATUS_PASS)
+
+        monkeypatch.setattr(
+            validator_module,
+            "LEVEL_RUNNERS",
+            {"L0": l0_runner, "L1": l1_runner, "L2": l1_runner, "L3": l1_runner, "L4": l1_runner, "L5": l1_runner, "L6": l1_runner},
+        )
+        result = R3Validator(cfg).run(
+            mode="gated",
+            target="full_r3_portfolio",
+            symbols=["BTC/USDT:USDT"],
+            initial_capital=5000,
+            output_dir=tmp_path,
+            simulations=10,
+            seed=7,
+        )
+        assert calls == ["L0"]
+        assert len(result.target_results[0].level_results) == 1
+
+    def test_target_all_expands_single_strategies_and_full_portfolio(self):
+        assert expand_targets("all") == [
+            "trend_pullback_only",
+            "mean_reversion_only",
+            "funding_reversal_only",
+            "full_r3_portfolio",
+        ]
+
+    def test_single_strategy_result_cannot_approve_dry_run(self, cfg, tmp_path, monkeypatch):
+        monkeypatch.setattr(validator_module, "LEVEL_RUNNERS", self._all_pass_runners())
+        result = R3Validator(cfg).run(
+            mode="diagnostic",
+            target="trend_pullback_only",
+            symbols=["BTC/USDT:USDT"],
+            initial_capital=5000,
+            output_dir=tmp_path,
+            simulations=10,
+            seed=7,
+        )
+        assert result.conclusion == CONCLUSION_REJECTED
+        assert result.conclusion != CONCLUSION_APPROVED
+        assert result.conclusion in ALLOWED_CONCLUSIONS
+        assert NOTE_SINGLE_STRATEGY_DIAGNOSTIC in result.target_results[0].notes
+        assert NOTE_SINGLE_STRATEGY_CANNOT_APPROVE in result.target_results[0].notes
+
+    def test_full_portfolio_only_can_approve_for_dry_run(self, cfg, tmp_path, monkeypatch):
+        monkeypatch.setattr(validator_module, "LEVEL_RUNNERS", self._all_pass_runners())
+        result = R3Validator(cfg).run(
+            mode="gated",
+            target="full_r3_portfolio",
+            symbols=["BTC/USDT:USDT"],
+            initial_capital=5000,
+            output_dir=tmp_path,
+            simulations=10,
+            seed=7,
+        )
+        assert result.conclusion == CONCLUSION_APPROVED
+
+    def test_diagnostic_full_portfolio_all_pass_cannot_approve(self, cfg, tmp_path, monkeypatch):
+        monkeypatch.setattr(validator_module, "LEVEL_RUNNERS", self._all_pass_runners())
+        result = R3Validator(cfg).run(
+            mode="diagnostic",
+            target="full_r3_portfolio",
+            symbols=["BTC/USDT:USDT"],
+            initial_capital=5000,
+            output_dir=tmp_path,
+            simulations=10,
+            seed=7,
+        )
+        assert result.conclusion == CONCLUSION_REJECTED
+        assert result.conclusion != CONCLUSION_APPROVED
+        assert result.conclusion in ALLOWED_CONCLUSIONS
+
+    def test_diagnostic_target_all_all_pass_cannot_approve(self, cfg, tmp_path, monkeypatch):
+        monkeypatch.setattr(validator_module, "LEVEL_RUNNERS", self._all_pass_runners())
+        result = R3Validator(cfg).run(
+            mode="diagnostic",
+            target="all",
+            symbols=["BTC/USDT:USDT"],
+            initial_capital=5000,
+            output_dir=tmp_path,
+            simulations=10,
+            seed=7,
+        )
+        assert result.conclusion == CONCLUSION_REJECTED
+        assert result.conclusion != CONCLUSION_APPROVED
+        assert result.conclusion in ALLOWED_CONCLUSIONS
+
+    @pytest.mark.parametrize("target", [
+        "trend_pullback_only",
+        "mean_reversion_only",
+        "funding_reversal_only",
+    ])
+    def test_single_strategy_all_pass_uses_allowed_non_approved_conclusion(self, cfg, tmp_path, monkeypatch, target):
+        monkeypatch.setattr(validator_module, "LEVEL_RUNNERS", self._all_pass_runners())
+        result = R3Validator(cfg).run(
+            mode="gated",
+            target=target,
+            symbols=["BTC/USDT:USDT"],
+            initial_capital=5000,
+            output_dir=tmp_path,
+            simulations=10,
+            seed=7,
+        )
+        assert result.conclusion == CONCLUSION_REJECTED
+        assert result.conclusion in ALLOWED_CONCLUSIONS
+        assert result.target_results[0].conclusion in ALLOWED_CONCLUSIONS
+        assert result.conclusion != CONCLUSION_APPROVED
+
+    def test_l0_pass_fail_judgement_uses_config_thresholds(self, cfg):
+        passing = {
+            "total_trades": 300,
+            "profit_factor": 1.3,
+            "sharpe_ratio": 1.5,
+            "max_drawdown_pct": 12.0,
+            "calmar_ratio": 1.4,
+            "average_trade_pnl": 2.0,
+            "net_profit": 1000.0,
+            "total_fees": 300.0,
+            "total_slippage": 0.0,
+            "total_funding": 0.0,
+        }
+        status, passed, _ = evaluate_l0_pass(passing, cfg)
+        assert status == STATUS_PASS
+        assert passed
+
+        failing = {**passing, "profit_factor": 1.0}
+        status, passed, reason = evaluate_l0_pass(failing, cfg)
+        assert status == STATUS_FAIL
+        assert not passed
+        assert "profit_factor" in reason
+
+    def test_l0_total_trades_boundary_must_be_greater_than_config_min(self, cfg):
+        base = {
+            "profit_factor": 1.3,
+            "sharpe_ratio": 1.5,
+            "max_drawdown_pct": 12.0,
+            "calmar_ratio": 1.4,
+            "average_trade_pnl": 2.0,
+            "net_profit": 1000.0,
+            "total_fees": 300.0,
+            "total_slippage": 0.0,
+            "total_funding": 0.0,
+        }
+        status, passed, reason = evaluate_l0_pass({**base, "total_trades": 250}, cfg)
+        assert status != STATUS_PASS
+        assert not passed
+        assert reason == "INSUFFICIENT_DATA"
+
+        status, passed, _ = evaluate_l0_pass({**base, "total_trades": 251}, cfg)
+        assert status == STATUS_PASS
+        assert passed
+
+    def test_trend_pullback_l0_target_metrics_exclude_other_strategies(self, cfg):
+        context = SimpleNamespace(cfg=cfg, initial_capital=5000.0)
+        trade_log, daily_pnl, equity_curve, metrics = target_artifacts(
+            context,
+            "trend_pullback_only",
+            self._fake_validation_backtest(),
+        )
+        assert set(trade_log["strategy_name"]) == {"trend_pullback"}
+        assert len(trade_log) == 1
+        assert metrics["total_trades"] == 1
+        assert metrics["final_equity"] == pytest.approx(5099.0)
+        assert not daily_pnl.empty
+        assert not equity_curve.empty
+
+    def test_mean_reversion_l5_target_metrics_exclude_trend_and_funding(self, cfg):
+        context = SimpleNamespace(cfg=cfg, initial_capital=5000.0)
+        trade_log, _, _, metrics = target_artifacts(
+            context,
+            "mean_reversion_only",
+            self._fake_validation_backtest(),
+        )
+        assert set(trade_log["strategy_name"]) == {"mean_reversion"}
+        assert metrics["total_trades"] == 1
+        assert metrics["final_equity"] == pytest.approx(5049.0)
+
+    def test_full_portfolio_target_metrics_use_all_strategies(self, cfg):
+        context = SimpleNamespace(cfg=cfg, initial_capital=5000.0)
+        trade_log, _, _, metrics = target_artifacts(
+            context,
+            "full_r3_portfolio",
+            self._fake_validation_backtest(),
+        )
+        assert set(trade_log["strategy_name"]) == {
+            "trend_pullback",
+            "mean_reversion",
+            "funding_reversal",
+        }
+        assert metrics["total_trades"] == 3
+
+    def test_l1_window_metrics_are_target_specific(self, cfg, monkeypatch):
+        fake = self._fake_validation_backtest()
+
+        class FakeBacktestEngine:
+            def __init__(self, cfg, *, initial_capital):
+                self.cfg = cfg
+                self.initial_capital = initial_capital
+
+            def run(self, **kwargs):
+                return fake
+
+        context = ValidationContext(
+            cfg=cfg,
+            mode="diagnostic",
+            target="mean_reversion_only",
+            symbols=["BTC/USDT:USDT"],
+            initial_capital=5000.0,
+            output_dir=Path("."),
+            simulations=10,
+            seed=7,
+            data_by_symbol=_bt_data(n_5m=24, n_1h=8, n_4h=4),
+        )
+        monkeypatch.setattr(l1_module, "BacktestEngine", FakeBacktestEngine)
+        metrics = l1_module._run_window(
+            context,
+            "mean_reversion_only",
+            datetime(2026, 1, 1, tzinfo=UTC),
+            datetime(2026, 1, 2, tzinfo=UTC),
+        )
+        assert metrics["total_trades"] == 1
+        assert metrics["validation_target"] == "mean_reversion_only"
+
+    def test_l1_fold_metrics_are_aggregated(self):
+        folds = pd.DataFrame({
+            "is_total_return_pct": [10.0, 20.0],
+            "oos_total_return_pct": [8.0, -2.0],
+            "oos_net_profit": [100.0, -20.0],
+            "oos_sharpe_ratio": [1.0, 0.5],
+            "oos_profit_factor": [1.2, 0.9],
+        })
+        summary = aggregate_fold_metrics(folds)
+        assert summary["oos_sharpe"] == pytest.approx(0.75)
+        assert summary["oos_profit_factor"] == pytest.approx(1.05)
+        assert summary["positive_fold_ratio"] == pytest.approx(0.5)
+
+    def test_l2_mcpt_percentiles_are_calculated(self):
+        results = pd.DataFrame({
+            "final_equity": [4900.0, 5000.0, 5100.0, 5200.0, 5300.0],
+            "cagr": [-0.02, 0.0, 0.02, 0.04, 0.06],
+            "max_drawdown_pct": [10.0, 12.0, 14.0, 16.0, 18.0],
+            "risk_of_ruin_event": [False, False, False, False, True],
+            "profit_factor": [0.9, 1.0, 1.1, 1.2, 1.3],
+        })
+        metrics = mcpt_metrics(results, 5000.0)
+        assert metrics["simulations"] == 5
+        assert metrics["pct5_final_equity"] == pytest.approx(results["final_equity"].quantile(0.05))
+        assert metrics["risk_of_ruin"] == pytest.approx(0.2)
+        assert metrics["median_profit_factor"] == pytest.approx(1.1)
+
+    def test_l3_bootstrap_uses_required_block_sizes(self):
+        returns = np.array([10.0, -3.0, 7.0, -2.0, 8.0] * 5)
+        result = run_block_bootstrap(
+            returns=returns,
+            initial_capital=5000,
+            simulations=2,
+            seed=1,
+            block_sizes=BLOCK_SIZES,
+        )
+        assert sorted(result["block_size"].unique().tolist()) == BLOCK_SIZES
+
+    def test_l4_bonferroni_corrected_p_value(self):
+        result = bonferroni_correction(raw_p_value=0.01, combinations=5, alpha=0.05)
+        assert result["corrected_alpha"] == pytest.approx(0.01)
+        assert result["corrected_p_value"] == pytest.approx(0.05)
+
+    def test_l5_oos_split_does_not_look_ahead(self):
+        data = _bt_data(n_5m=20, n_1h=10, n_4h=5)
+        insample, oos, split_time = split_final_oos(data, oos_fraction=0.20)
+        for symbol in data:
+            assert insample[symbol]["5m"].index.max() < split_time
+            assert oos[symbol]["5m"].index.min() >= split_time
+
+    def test_l6_regime_matrix_has_required_columns(self):
+        trade_log = pd.DataFrame({
+            "strategy_name": ["trend_pullback"],
+            "realized_pnl": [100.0],
+            "trend_strength": ["Trend High"],
+            "volatility_regime": ["Volatility Low"],
+            "funding_regime": ["Neutral"],
+            "market_regime": ["Bull"],
+        })
+        matrix = build_regime_strategy_matrix(trade_log)
+        assert list(matrix.columns) == MATRIX_COLUMNS
+        assert matrix.iloc[0]["strategy_type"] == "trend_pullback"
+
+    def test_summary_reports_are_written(self, tmp_path):
+        level = self._level_result("L0", STATUS_PASS)
+        run_result = SimpleNamespace(
+            mode="diagnostic",
+            targets=["full_r3_portfolio"],
+            target_results=[
+                SimpleNamespace(
+                    target="full_r3_portfolio",
+                    validation_type="full_portfolio_validation",
+                    conclusion=CONCLUSION_APPROVED,
+                    level_results=[level],
+                )
+            ],
+            conclusion=CONCLUSION_REJECTED,
+            output_dir=tmp_path,
+            artifacts={},
+            notes=[],
+        )
+        result = write_validation_reports(run_result)
+        assert (tmp_path / "validation_summary.md").exists()
+        assert (tmp_path / "pass_fail_matrix.csv").exists()
+        assert (tmp_path / "failure_diagnostics.md").exists()
+        assert "validation_summary_md" in result.artifacts
+
+    def test_validation_summary_json_conclusion_uses_allowed_set(self, tmp_path):
+        level = self._level_result("L0", STATUS_PASS)
+        run_result = SimpleNamespace(
+            mode="diagnostic",
+            targets=["trend_pullback_only"],
+            target_results=[
+                SimpleNamespace(
+                    target="trend_pullback_only",
+                    validation_type="single_strategy_diagnostic",
+                    conclusion=CONCLUSION_REJECTED,
+                    notes=[NOTE_SINGLE_STRATEGY_DIAGNOSTIC, NOTE_SINGLE_STRATEGY_CANNOT_APPROVE],
+                    level_results=[level],
+                )
+            ],
+            conclusion=CONCLUSION_REJECTED,
+            output_dir=tmp_path,
+            artifacts={},
+            notes=[],
+        )
+        write_validation_reports(run_result)
+        data = __import__("json").loads((tmp_path / "validation_summary.json").read_text(encoding="utf-8"))
+        assert data["conclusion"] in ALLOWED_CONCLUSIONS
+        assert data["targets_detail"][0]["conclusion"] in ALLOWED_CONCLUSIONS
+
+    def test_smoke_mode_conclusion_not_for_decision(self, cfg, tmp_path, monkeypatch):
+        monkeypatch.setattr(validator_module, "LEVEL_RUNNERS", self._all_pass_runners())
+        result = R3Validator(cfg).run(
+            mode="diagnostic",
+            target="all",
+            symbols=["BTC/USDT:USDT"],
+            initial_capital=5000,
+            output_dir=tmp_path,
+            simulations=10,
+            seed=7,
+            max_runtime_smoke=True,
+        )
+        assert result.conclusion == CONCLUSION_SMOKE
+        assert all(item.conclusion == CONCLUSION_SMOKE for item in result.target_results)
+
+
+class TestSprint7Regression:
+    def test_no_forbidden_sprint7_implementations(self):
+        import re
+        from pathlib import Path
+        root = Path(__file__).resolve().parents[1]
+        checked = [
+            root / "strategies" / "r3" / "validation" / "l0_backtest.py",
+            root / "strategies" / "r3" / "validation" / "l1_walk_forward.py",
+            root / "strategies" / "r3" / "validation" / "l2_mcpt.py",
+            root / "strategies" / "r3" / "validation" / "l3_bootstrap.py",
+            root / "strategies" / "r3" / "validation" / "l4_bonferroni.py",
+            root / "strategies" / "r3" / "validation" / "l5_oos.py",
+            root / "strategies" / "r3" / "validation" / "l6_regime.py",
+            root / "strategies" / "r3" / "validation" / "validator.py",
+            root / "tools" / "r3_validate.py",
+        ]
+        for path in checked:
+            if not path.exists():
+                continue
+            text = path.read_text(encoding="utf-8")
+            text = re.sub(r'(?s)"""(?:.*?)"""|\'\'\'(?:.*?)\'\'\'', "", text)
+            text = re.sub(r"(?m)^\s*#.*$", "", text)
+            for forbidden in [
+                "create_order",
+                "place_order",
+                "market_order",
+                "ccxt",
+                "submit_live",
+                "execute_live",
+                "dry_run_order",
+                "strategy_rule_override",
+                "diagnostic_approved_for_dry_run",
+                "single_strategy_approved_for_dry_run",
             ]:
                 assert forbidden not in text
 
