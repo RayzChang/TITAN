@@ -235,7 +235,7 @@ class BacktestEngine:
             int(fcfg.lookback_days),
             int(fcfg.default_interval_hours),
             int(fcfg.min_samples_required),
-        )
+        ).dropna()
 
     def _prepare_premium_z(self, premium_df: pd.DataFrame | None) -> pd.Series:
         if premium_df is None or premium_df.empty or "close" not in premium_df.columns:
@@ -247,7 +247,7 @@ class BacktestEngine:
             completed["close"],
             window=window,
             min_samples=int(fcfg.min_samples_required),
-        )
+        ).dropna()
 
     def _combined_5m_timeline(self, prepared: dict[str, dict[str, pd.DataFrame]]) -> list[datetime]:
         values: set[pd.Timestamp] = set()
@@ -280,7 +280,9 @@ class BacktestEngine:
             portfolio.total_slippage += event.slippage
             portfolio.total_funding += event.funding_cost
             if event.exit_type == "STOP_LOSS":
-                cooldowns[(symbol, position.strategy_name)] = self._cooldown_after_stop(position, timestamp)
+                cooldown = self._cooldown_after_stop(position, timestamp)
+                if cooldown is not None:
+                    cooldowns[(symbol, position.strategy_name)] = cooldown
         if position.status == "CLOSED":
             portfolio.open_positions.pop(symbol, None)
 
@@ -511,9 +513,14 @@ class BacktestEngine:
             portfolio.open_positions.pop(symbol, None)
         portfolio.current_equity = portfolio.cash_balance
 
-    def _cooldown_after_stop(self, position: Position, timestamp: datetime) -> CooldownState:
+    def _cooldown_after_stop(self, position: Position, timestamp: datetime) -> CooldownState | None:
         strategy_cfg = getattr(self.cfg, position.strategy_name)
-        bars = int(strategy_cfg.cooldown_after.sl_exit_1h_bars)
+        cooldown_cfg = getattr(strategy_cfg, "cooldown_after", None)
+        if cooldown_cfg is None:
+            return None
+        bars = int(cooldown_cfg.sl_exit_1h_bars)
+        if bars <= 0:
+            return None
         return CooldownState(
             symbol=position.symbol,
             strategy_name=position.strategy_name,
@@ -574,10 +581,13 @@ def _latest_value(series: pd.Series | None, timestamp: datetime) -> float | None
     if series is None or series.empty:
         return None
     ts = _coerce_timestamp_for_index(series.index, timestamp)
-    segment = series.loc[series.index <= ts].dropna()
-    if segment.empty:
+    pos = series.index.searchsorted(ts, side="right") - 1
+    if pos < 0:
         return None
-    return float(segment.iloc[-1])
+    value = series.iloc[pos]
+    if pd.isna(value):
+        return None
+    return float(value)
 
 
 def _coerce_timestamp_for_index(index: pd.DatetimeIndex, timestamp: datetime) -> pd.Timestamp:

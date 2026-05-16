@@ -636,6 +636,11 @@ def attach_core_indicators(
         out["bb_middle"] = bands.middle
         out["bb_lower"] = bands.lower
         out["bb_width"] = bands.width
+        lookback_bars = cfg.regime.b_range.bb_width_percentile_lookback_days * 24
+        out["bb_width_pct_rank_1h"] = rolling_percentile_rank(
+            out["bb_width"],
+            window=lookback_bars,
+        )
 
         # VWAP 與 deviation
         if (out["volume"] > 0).any():
@@ -666,6 +671,12 @@ def attach_core_indicators(
         out[f"atr_{atr_period}"] = atr(
             out["high"], out["low"], out["close"], atr_period,
         )
+        rsi_periods = {
+            int(cfg.mean_reversion.entry.rsi_period),
+            int(cfg.funding_reversal.entry.rsi_period),
+        }
+        for rsi_period in rsi_periods:
+            out[f"rsi_{rsi_period}"] = rsi(out["close"], rsi_period)
 
         # Tight trailing pivot (5m, N=3, confirm 3)
         tt = cfg.pivot.tight_trailing

@@ -365,12 +365,24 @@ def evaluate_mean_reversion_setup(
 
 
 def ensure_mean_reversion_1h_columns(df_1h: pd.DataFrame, cfg: R3Config) -> pd.DataFrame:
-    out = df_1h.copy()
     atr_period = int(cfg.realized_vol.atr_period)
     rsi_period = int(cfg.mean_reversion.entry.rsi_period)
     atr_col = f"atr_{atr_period}"
     rsi_col = f"rsi_{rsi_period}"
+    required = {
+        atr_col,
+        rsi_col,
+        "bb_upper",
+        "bb_middle",
+        "bb_lower",
+        "vwap",
+        "vwap_upper",
+        "vwap_lower",
+    }
+    if required.issubset(df_1h.columns):
+        return df_1h
 
+    out = df_1h.copy()
     if rsi_col not in out.columns:
         out[rsi_col] = rsi(out["close"], rsi_period)
     if atr_col not in out.columns:
@@ -399,9 +411,12 @@ def ensure_mean_reversion_1h_columns(df_1h: pd.DataFrame, cfg: R3Config) -> pd.D
 
 
 def ensure_mean_reversion_5m_columns(df_5m: pd.DataFrame, cfg: R3Config) -> pd.DataFrame:
-    out = df_5m.copy()
     atr_period = int(cfg.realized_vol.atr_period)
     atr_col = f"atr_{atr_period}"
+    if atr_col in df_5m.columns:
+        return df_5m
+
+    out = df_5m.copy()
     if atr_col not in out.columns:
         out[atr_col] = atr(out["high"], out["low"], out["close"], atr_period)
     return out

@@ -115,7 +115,8 @@ class TrendConfirmation5M:
                 metrics_snapshot={"available_bars": len(df), "required": min_required},
             )
 
-        ema9 = ema(df["close"], self.ema9_period)
+        ema9_col = f"ema_{self.ema9_period}"
+        ema9 = df[ema9_col] if ema9_col in df.columns else ema(df["close"], self.ema9_period)
         last_close = float(df["close"].iloc[-1])
         last_open = float(df["open"].iloc[-1])
         last_high = float(df["high"].iloc[-1])
@@ -140,44 +141,28 @@ class TrendConfirmation5M:
             cond2_label = "C2_SHORT_CLOSE_BREAKS_PREV_LOW"
 
         if direction == "long":
-            engulf = bool(
-                bullish_engulfing(
-                    df["open"],
-                    df["close"],
-                    body_growth_min=self.engulfing_growth_min,
-                ).iloc[-1]
-            )
-            close_pattern = bool(
-                strong_close(
-                    df["open"],
-                    df["high"],
-                    df["low"],
-                    df["close"],
-                    close_position_min=self.strong_close_pos_min,
-                    body_ratio_min=self.strong_close_body_min,
-                ).iloc[-1]
+            engulf = _last_bullish_engulfing(df, self.engulfing_growth_min)
+            close_pattern = _last_strong_close(
+                last_open,
+                last_high,
+                last_low,
+                last_close,
+                self.strong_close_pos_min,
+                self.strong_close_body_min,
             )
             cond3 = engulf or close_pattern
             cond3_label = "C3_LONG_ENGULFING_OR_STRONG_CLOSE"
             engulf_key = "bullish_engulfing"
             close_key = "strong_close"
         else:
-            engulf = bool(
-                bearish_engulfing(
-                    df["open"],
-                    df["close"],
-                    body_growth_min=self.engulfing_growth_min,
-                ).iloc[-1]
-            )
-            close_pattern = bool(
-                weak_close(
-                    df["open"],
-                    df["high"],
-                    df["low"],
-                    df["close"],
-                    close_position_min=self.strong_close_pos_min,
-                    body_ratio_min=self.strong_close_body_min,
-                ).iloc[-1]
+            engulf = _last_bearish_engulfing(df, self.engulfing_growth_min)
+            close_pattern = _last_weak_close(
+                last_open,
+                last_high,
+                last_low,
+                last_close,
+                self.strong_close_pos_min,
+                self.strong_close_body_min,
             )
             cond3 = engulf or close_pattern
             cond3_label = "C3_SHORT_ENGULFING_OR_WEAK_CLOSE"
@@ -319,14 +304,12 @@ class MeanReversionConfirmation5M:
                 strategy_name=self.strategy_name,
             )
 
-        out = df.copy()
         rsi_col = f"rsi_{self.rsi_period}"
-        if rsi_col not in out.columns:
-            out[rsi_col] = rsi(out["close"], self.rsi_period)
+        rsi_values = df[rsi_col] if rsi_col in df.columns else rsi(df["close"], self.rsi_period)
 
-        last = out.iloc[-1]
-        prev_rsi = float(out[rsi_col].iloc[-2])
-        current_rsi = float(out[rsi_col].iloc[-1])
+        last = df.iloc[-1]
+        prev_rsi = float(rsi_values.iloc[-2])
+        current_rsi = float(rsi_values.iloc[-1])
         open_ = float(last["open"])
         high = float(last["high"])
         low = float(last["low"])
@@ -344,23 +327,15 @@ class MeanReversionConfirmation5M:
             cond_close = close < open_ and close_position >= self.close_position_min
 
         if direction == "long":
-            engulf = bool(
-                bullish_engulfing(
-                    out["open"],
-                    out["close"],
-                    body_growth_min=self.engulfing_growth_min,
-                ).iloc[-1]
-            )
-            candle_pattern = bool(
-                hammer(
-                    out["open"],
-                    out["high"],
-                    out["low"],
-                    out["close"],
-                    body_max_ratio=self.hammer_body_max_ratio,
-                    lower_shadow_ratio_min=self.hammer_shadow_ratio_min,
-                    upper_shadow_max_ratio=self.hammer_upper_shadow_max_ratio,
-                ).iloc[-1]
+            engulf = _last_bullish_engulfing(df, self.engulfing_growth_min)
+            candle_pattern = _last_hammer(
+                open_,
+                high,
+                low,
+                close,
+                self.hammer_body_max_ratio,
+                self.hammer_shadow_ratio_min,
+                self.hammer_upper_shadow_max_ratio,
             )
             cond_pattern = engulf or candle_pattern
             cond_rsi = current_rsi < self.rsi_oversold and current_rsi > prev_rsi
@@ -374,23 +349,15 @@ class MeanReversionConfirmation5M:
                 "hammer": candle_pattern,
             }
         else:
-            engulf = bool(
-                bearish_engulfing(
-                    out["open"],
-                    out["close"],
-                    body_growth_min=self.engulfing_growth_min,
-                ).iloc[-1]
-            )
-            candle_pattern = bool(
-                shooting_star(
-                    out["open"],
-                    out["high"],
-                    out["low"],
-                    out["close"],
-                    body_max_ratio=self.shooting_star_body_max_ratio,
-                    upper_shadow_ratio_min=self.shooting_star_shadow_ratio_min,
-                    lower_shadow_max_ratio=self.shooting_star_lower_shadow_max_ratio,
-                ).iloc[-1]
+            engulf = _last_bearish_engulfing(df, self.engulfing_growth_min)
+            candle_pattern = _last_shooting_star(
+                open_,
+                high,
+                low,
+                close,
+                self.shooting_star_body_max_ratio,
+                self.shooting_star_shadow_ratio_min,
+                self.shooting_star_lower_shadow_max_ratio,
             )
             cond_pattern = engulf or candle_pattern
             cond_rsi = current_rsi > self.rsi_overbought and current_rsi < prev_rsi
@@ -526,14 +493,12 @@ class FundingReversalConfirmation5M:
                 strategy_name=self.strategy_name,
             )
 
-        out = df.copy()
         rsi_col = f"rsi_{self.rsi_period}"
-        if rsi_col not in out.columns:
-            out[rsi_col] = rsi(out["close"], self.rsi_period)
+        rsi_values = df[rsi_col] if rsi_col in df.columns else rsi(df["close"], self.rsi_period)
 
-        last = out.iloc[-1]
-        prev_rsi = float(out[rsi_col].iloc[-2])
-        current_rsi = float(out[rsi_col].iloc[-1])
+        last = df.iloc[-1]
+        prev_rsi = float(rsi_values.iloc[-2])
+        current_rsi = float(rsi_values.iloc[-1])
         open_ = float(last["open"])
         high = float(last["high"])
         low = float(last["low"])
@@ -551,23 +516,15 @@ class FundingReversalConfirmation5M:
             cond_close = close < open_ and close_position >= self.close_position_min
 
         if direction == "long":
-            engulf = bool(
-                bullish_engulfing(
-                    out["open"],
-                    out["close"],
-                    body_growth_min=self.engulfing_growth_min,
-                ).iloc[-1]
-            )
-            candle_pattern = bool(
-                hammer(
-                    out["open"],
-                    out["high"],
-                    out["low"],
-                    out["close"],
-                    body_max_ratio=self.hammer_body_max_ratio,
-                    lower_shadow_ratio_min=self.hammer_shadow_ratio_min,
-                    upper_shadow_max_ratio=self.hammer_upper_shadow_max_ratio,
-                ).iloc[-1]
+            engulf = _last_bullish_engulfing(df, self.engulfing_growth_min)
+            candle_pattern = _last_hammer(
+                open_,
+                high,
+                low,
+                close,
+                self.hammer_body_max_ratio,
+                self.hammer_shadow_ratio_min,
+                self.hammer_upper_shadow_max_ratio,
             )
             cond_pattern = engulf or candle_pattern
             cond_rsi = current_rsi < self.rsi_oversold and current_rsi > prev_rsi
@@ -581,23 +538,15 @@ class FundingReversalConfirmation5M:
                 "hammer": candle_pattern,
             }
         else:
-            engulf = bool(
-                bearish_engulfing(
-                    out["open"],
-                    out["close"],
-                    body_growth_min=self.engulfing_growth_min,
-                ).iloc[-1]
-            )
-            candle_pattern = bool(
-                shooting_star(
-                    out["open"],
-                    out["high"],
-                    out["low"],
-                    out["close"],
-                    body_max_ratio=self.shooting_star_body_max_ratio,
-                    upper_shadow_ratio_min=self.shooting_star_shadow_ratio_min,
-                    lower_shadow_max_ratio=self.shooting_star_lower_shadow_max_ratio,
-                ).iloc[-1]
+            engulf = _last_bearish_engulfing(df, self.engulfing_growth_min)
+            candle_pattern = _last_shooting_star(
+                open_,
+                high,
+                low,
+                close,
+                self.shooting_star_body_max_ratio,
+                self.shooting_star_shadow_ratio_min,
+                self.shooting_star_lower_shadow_max_ratio,
             )
             cond_pattern = engulf or candle_pattern
             cond_rsi = current_rsi > self.rsi_overbought and current_rsi < prev_rsi
@@ -639,6 +588,116 @@ class FundingReversalConfirmation5M:
             },
             strategy_name=self.strategy_name,
         )
+
+
+def _last_bullish_engulfing(df: pd.DataFrame, body_growth_min: float) -> bool:
+    if len(df) < 2:
+        return False
+    prev = df.iloc[-2]
+    curr = df.iloc[-1]
+    curr_body = abs(float(curr["close"]) - float(curr["open"]))
+    prev_body = abs(float(prev["close"]) - float(prev["open"]))
+    return (
+        float(curr["close"]) > float(curr["open"])
+        and float(curr["close"]) > float(prev["open"])
+        and float(curr["open"]) < float(prev["close"])
+        and curr_body > prev_body * body_growth_min
+    )
+
+
+def _last_bearish_engulfing(df: pd.DataFrame, body_growth_min: float) -> bool:
+    if len(df) < 2:
+        return False
+    prev = df.iloc[-2]
+    curr = df.iloc[-1]
+    curr_body = abs(float(curr["close"]) - float(curr["open"]))
+    prev_body = abs(float(prev["close"]) - float(prev["open"]))
+    return (
+        float(curr["close"]) < float(curr["open"])
+        and float(curr["close"]) < float(prev["open"])
+        and float(curr["open"]) > float(prev["close"])
+        and curr_body > prev_body * body_growth_min
+    )
+
+
+def _last_strong_close(
+    open_: float,
+    high: float,
+    low: float,
+    close: float,
+    close_position_min: float,
+    body_ratio_min: float,
+) -> bool:
+    range_ = high - low
+    if range_ <= 0:
+        return False
+    return (
+        close > open_
+        and (close - low) / range_ >= close_position_min
+        and abs(close - open_) / range_ >= body_ratio_min
+    )
+
+
+def _last_weak_close(
+    open_: float,
+    high: float,
+    low: float,
+    close: float,
+    close_position_min: float,
+    body_ratio_min: float,
+) -> bool:
+    range_ = high - low
+    if range_ <= 0:
+        return False
+    return (
+        close < open_
+        and (high - close) / range_ >= close_position_min
+        and abs(close - open_) / range_ >= body_ratio_min
+    )
+
+
+def _last_hammer(
+    open_: float,
+    high: float,
+    low: float,
+    close: float,
+    body_max_ratio: float,
+    lower_shadow_ratio_min: float,
+    upper_shadow_max_ratio: float,
+) -> bool:
+    range_ = high - low
+    if range_ <= 0:
+        return False
+    body = abs(close - open_)
+    upper_shadow = high - max(close, open_)
+    lower_shadow = min(close, open_) - low
+    return (
+        body / range_ <= body_max_ratio
+        and lower_shadow >= upper_shadow * lower_shadow_ratio_min
+        and upper_shadow / range_ <= upper_shadow_max_ratio
+    )
+
+
+def _last_shooting_star(
+    open_: float,
+    high: float,
+    low: float,
+    close: float,
+    body_max_ratio: float,
+    upper_shadow_ratio_min: float,
+    lower_shadow_max_ratio: float,
+) -> bool:
+    range_ = high - low
+    if range_ <= 0:
+        return False
+    body = abs(close - open_)
+    upper_shadow = high - max(close, open_)
+    lower_shadow = min(close, open_) - low
+    return (
+        body / range_ <= body_max_ratio
+        and upper_shadow >= lower_shadow * upper_shadow_ratio_min
+        and lower_shadow / range_ <= lower_shadow_max_ratio
+    )
 
 
 def _slice_until(df: pd.DataFrame, as_of: datetime) -> pd.DataFrame:

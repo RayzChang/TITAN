@@ -531,7 +531,11 @@ def build_snapshot_from_indicators(
 
     # BB width percentile rank（rolling 90D × 24 bars/day = 2160 視窗）
     bb_width_pct_rank: float | None = None
-    if "bb_width" in df_1h_with_indicators.columns:
+    if "bb_width_pct_rank_1h" in df_1h_with_indicators.columns:
+        value = _last_or_none(last_1h, "bb_width_pct_rank_1h")
+        if value is not None and not _is_nan(value):
+            bb_width_pct_rank = value
+    elif "bb_width" in df_1h_with_indicators.columns:
         lookback_bars = cfg.regime.b_range.bb_width_percentile_lookback_days * 24
         ranks = rolling_percentile_rank(df_1h_with_indicators["bb_width"], window=lookback_bars)
         if len(ranks) > 0 and not _is_nan(ranks.iloc[-1]):

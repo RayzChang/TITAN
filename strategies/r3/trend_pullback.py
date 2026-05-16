@@ -494,14 +494,17 @@ def evaluate_signal_window(
 
 
 def ensure_1h_signal_columns(df_1h: pd.DataFrame, cfg: R3Config) -> pd.DataFrame:
-    out = df_1h.copy()
     entry_cfg = cfg.trend_pullback.entry
     atr_period = int(cfg.realized_vol.atr_period)
     ema_short_col = f"ema_{int(entry_cfg.ema_short_period)}"
     ema_long_col = f"ema_{int(entry_cfg.ema_long_period)}"
     rsi_col = f"rsi_{int(entry_cfg.rsi_period)}"
     atr_col = f"atr_{atr_period}"
+    required = {ema_short_col, ema_long_col, rsi_col, atr_col}
+    if required.issubset(df_1h.columns):
+        return df_1h
 
+    out = df_1h.copy()
     if ema_short_col not in out.columns:
         out[ema_short_col] = ema(out["close"], int(entry_cfg.ema_short_period))
     if ema_long_col not in out.columns:
@@ -514,9 +517,12 @@ def ensure_1h_signal_columns(df_1h: pd.DataFrame, cfg: R3Config) -> pd.DataFrame
 
 
 def ensure_5m_execution_columns(df_5m: pd.DataFrame, cfg: R3Config) -> pd.DataFrame:
-    out = df_5m.copy()
     atr_period = int(cfg.realized_vol.atr_period)
     atr_col = f"atr_{atr_period}"
+    if atr_col in df_5m.columns:
+        return df_5m
+
+    out = df_5m.copy()
     if atr_col not in out.columns:
         out[atr_col] = atr(out["high"], out["low"], out["close"], atr_period)
     return out
