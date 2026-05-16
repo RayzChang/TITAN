@@ -60,6 +60,7 @@ class R3Validator:
         simulations: int,
         seed: int,
         max_runtime_smoke: bool = False,
+        levels: list[str] | None = None,
         start=None,
         end=None,
         data_by_symbol=None,
@@ -68,6 +69,7 @@ class R3Validator:
     ) -> ValidationRunResult:
         mode = _normalize_mode(mode)
         targets = expand_targets(target)
+        selected_levels = _normalize_levels(levels)
         output_path = Path(output_dir)
         target_results: list[TargetValidationResult] = []
         shared_cache = {}
@@ -89,7 +91,7 @@ class R3Validator:
                 premium_by_symbol=premium_by_symbol,
                 cache=shared_cache,
             )
-            target_results.append(self._run_target(context, one_target))
+            target_results.append(self._run_target(context, one_target, selected_levels))
         run_result = ValidationRunResult(
             mode=mode,
             targets=targets,
@@ -100,9 +102,14 @@ class R3Validator:
         )
         return write_validation_reports(run_result)
 
-    def _run_target(self, context: ValidationContext, target: str) -> TargetValidationResult:
+    def _run_target(
+        self,
+        context: ValidationContext,
+        target: str,
+        levels: list[str],
+    ) -> TargetValidationResult:
         level_results: list[LevelResult] = []
-        for level in VALIDATION_LEVELS:
+        for level in levels:
             result = LEVEL_RUNNERS[level](context, target)
             level_results.append(result)
             if context.mode == "gated" and is_terminal_failure(result):
@@ -138,7 +145,11 @@ class R3Validator:
             return CONCLUSION_REJECTED
         if any(result.data_warnings for result in level_results):
             return CONCLUSION_INSUFFICIENT_DATA
-        if all(result.passed for result in level_results) and len(level_results) == len(VALIDATION_LEVELS):
+        observed_levels = [result.level for result in level_results]
+        if (
+            observed_levels == VALIDATION_LEVELS
+            and all(result.passed for result in level_results)
+        ):
             return CONCLUSION_APPROVED
         return CONCLUSION_REJECTED
 
@@ -218,3 +229,15 @@ def _normalize_mode(mode: str) -> str:
     if mode not in {"diagnostic", "gated"}:
         raise ValueError("mode must be diagnostic or gated")
     return mode
+
+
+def _normalize_levels(levels: list[str] | None) -> list[str]:
+    if levels is None:
+        return list(VALIDATION_LEVELS)
+    selected = list(levels)
+    if selected == ["all"]:
+        return list(VALIDATION_LEVELS)
+    unsupported = [level for level in selected if level not in VALIDATION_LEVELS]
+    if unsupported:
+        raise ValueError(f"Unsupported validation levels: {', '.join(unsupported)}")
+    return selected

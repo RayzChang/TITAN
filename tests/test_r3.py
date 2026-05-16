@@ -83,6 +83,7 @@ from strategies.r3.validation.common import (
     NOTE_SINGLE_STRATEGY_DIAGNOSTIC,
     STATUS_FAIL,
     STATUS_PASS,
+    VALIDATION_LEVELS,
     LevelResult,
     ValidationContext,
 )
@@ -2127,10 +2128,15 @@ class TestSprint6BacktestEngine:
             index=pd.date_range(datetime(2026, 1, 1, tzinfo=UTC), periods=130, freq="1h"),
         )
         z = BacktestEngine(cfg)._prepare_premium_z(premium)
-        first_close = pd.Timestamp(datetime(2026, 1, 1, 1, tzinfo=UTC))
-        assert z.index[0] == first_close
-        assert pd.Timestamp(datetime(2026, 1, 1, tzinfo=UTC)) not in z.index
-        assert z.loc[z.index <= pd.Timestamp(datetime(2026, 1, 1, 0, 30, tzinfo=UTC))].empty
+        fcfg = cfg.funding
+        unshifted = ind.premium_z(
+            premium["close"],
+            window=int(fcfg.lookback_days * 24),
+            min_samples=int(fcfg.min_samples_required),
+        ).dropna()
+        assert z.index[0] == unshifted.index[0] + timedelta(hours=1)
+        assert unshifted.index[0] not in z.index
+        assert z.loc[z.index <= unshifted.index[0] + timedelta(minutes=30)].empty
 
     def test_can_run_single_symbol_short_data(self, cfg):
         result = BacktestEngine(cfg).run(data_by_symbol=_bt_data())
@@ -2180,6 +2186,27 @@ class TestSprint6BacktestEngine:
             current_ask=100.1,
         )
         assert signal is None
+
+    def test_missing_strategy_cooldown_config_does_not_crash(self, cfg):
+        position = Position(
+            position_id="pos-1",
+            signal_id="sig-1",
+            symbol="BTC/USDT:USDT",
+            strategy_name="funding_reversal",
+            direction="long",
+            entry_timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+            entry_price=100.0,
+            quantity=1.0,
+            remaining_quantity=1.0,
+            stop_price=99.0,
+            tp1_price=101.0,
+            tp2_price=102.0,
+            time_stop_at=None,
+        )
+        assert BacktestEngine(cfg)._cooldown_after_stop(
+            position,
+            datetime(2026, 1, 1, 1, tzinfo=UTC),
+        ) is None
 
 
 class TestSprint6OrderFillSimulation:
@@ -2606,6 +2633,64 @@ class TestSprint7ValidationPipeline:
             "funding_reversal_only",
             "full_r3_portfolio",
         ]
+
+    def test_level_l0_only_runs_l0(self, cfg, tmp_path, monkeypatch):
+        calls = []
+
+        def make_runner(level: str):
+            def _runner(context, target):
+                calls.append(level)
+                context.child_output_dir(target, level)
+                return self._level_result(level, STATUS_PASS)
+            return _runner
+
+        monkeypatch.setattr(
+            validator_module,
+            "LEVEL_RUNNERS",
+            {level: make_runner(level) for level in VALIDATION_LEVELS},
+        )
+        result = R3Validator(cfg).run(
+            mode="diagnostic",
+            target="full_r3_portfolio",
+            symbols=["BTC/USDT:USDT"],
+            initial_capital=5000,
+            output_dir=tmp_path,
+            simulations=10,
+            seed=7,
+            levels=["L0"],
+        )
+        assert calls == ["L0"]
+        assert [level.level for level in result.target_results[0].level_results] == ["L0"]
+        assert (tmp_path / "full_r3_portfolio" / "L0").exists()
+        for level in VALIDATION_LEVELS[1:]:
+            assert not (tmp_path / "full_r3_portfolio" / level).exists()
+
+    def test_level_all_runs_l0_to_l6(self, cfg, tmp_path, monkeypatch):
+        calls = []
+
+        def make_runner(level: str):
+            def _runner(context, target):
+                calls.append(level)
+                return self._level_result(level, STATUS_PASS)
+            return _runner
+
+        monkeypatch.setattr(
+            validator_module,
+            "LEVEL_RUNNERS",
+            {level: make_runner(level) for level in VALIDATION_LEVELS},
+        )
+        result = R3Validator(cfg).run(
+            mode="diagnostic",
+            target="full_r3_portfolio",
+            symbols=["BTC/USDT:USDT"],
+            initial_capital=5000,
+            output_dir=tmp_path,
+            simulations=10,
+            seed=7,
+            levels=None,
+        )
+        assert calls == VALIDATION_LEVELS
+        assert [level.level for level in result.target_results[0].level_results] == VALIDATION_LEVELS
 
     def test_single_strategy_result_cannot_approve_dry_run(self, cfg, tmp_path, monkeypatch):
         monkeypatch.setattr(validator_module, "LEVEL_RUNNERS", self._all_pass_runners())

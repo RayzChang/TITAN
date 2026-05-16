@@ -19,6 +19,7 @@ from strategies.r3.exchange import R3ExchangeData
 from strategies.r3.validation.common import (
     CONCLUSION_APPROVED,
     CONCLUSION_SMOKE,
+    VALIDATION_LEVELS,
     VALIDATION_TARGETS,
 )
 from strategies.r3.validation.validator import R3Validator
@@ -40,6 +41,7 @@ def main() -> int:
     print("  R3 Sprint 7 - L0-L6 Validation")
     print("=" * 80)
     print(f"  Mode        : {args.mode}")
+    print(f"  Level       : {args.level}")
     print(f"  Target      : {args.target}")
     print(f"  Smoke only  : {args.max_runtime_smoke}")
     print(f"  Range       : {start:%Y-%m-%d %H:%M} -> {end:%Y-%m-%d %H:%M} UTC")
@@ -57,6 +59,7 @@ def main() -> int:
         simulations=args.simulations,
         seed=args.seed,
         max_runtime_smoke=args.max_runtime_smoke,
+        levels=_selected_levels(args.level),
         start=start,
         end=end,
         data_by_symbol=data_by_symbol,
@@ -89,6 +92,7 @@ def main() -> int:
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run R3 L0-L6 validation reports.")
     parser.add_argument("--mode", choices=["diagnostic", "gated"], default="diagnostic")
+    parser.add_argument("--level", choices=["all", *VALIDATION_LEVELS], default="all")
     parser.add_argument("--target", choices=[*VALIDATION_TARGETS, "all"], default="full_r3_portfolio")
     parser.add_argument("--symbols", nargs="+", default=SYMBOLS)
     parser.add_argument("--initial-capital", type=float, default=5000.0)
@@ -99,6 +103,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--simulations", type=int, default=1000)
     parser.add_argument("--seed", type=int, default=7)
     return parser.parse_args()
+
+
+def _selected_levels(level: str) -> list[str] | None:
+    if level == "all":
+        return None
+    return [level]
 
 
 def _resolve_range(args: argparse.Namespace, cfg: R3Config) -> tuple[datetime, datetime]:
